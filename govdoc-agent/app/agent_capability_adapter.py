@@ -65,6 +65,14 @@ def _legacy_verify() -> bool | str:
     return bool(settings.legacy_tls_verify)
 
 
+def _effective_legacy_cookie(cookies: str | None) -> str:
+    """优先使用请求透传 Cookie；缺失时回退到固定联调 Cookie。"""
+    incoming = (cookies or "").strip()
+    if incoming:
+        return incoming
+    return (settings.legacy_fixed_cookie or "").strip()
+
+
 def _read_sse_text(response: requests.Response) -> str:
     enc = (response.encoding or "").lower()
     if not enc or enc in ("iso-8859-1", "latin-1"):
@@ -100,12 +108,13 @@ def _try_legacy_json(path: str, payload: dict, cookies: str | None = None) -> Le
         return LegacyCallResult(False, path, error="legacy_base_url_missing")
     url = f"{base}{path}"
     try:
+        effective_cookie = _effective_legacy_cookie(cookies)
         log_stage(
             "skill.legacy_json.request",
             {
                 "url": url,
                 "payload": payload,
-                "cookiePreview": mask_cookie(cookies),
+                "cookiePreview": mask_cookie(effective_cookie),
             },
             enabled=settings.debug_runtime_logs,
             max_chars=settings.debug_log_max_chars,
@@ -114,7 +123,7 @@ def _try_legacy_json(path: str, payload: dict, cookies: str | None = None) -> Le
         response = requests.post(
             url,
             json=payload,
-            headers={"Cookie": cookies or ""},
+            headers={"Cookie": effective_cookie},
             timeout=20,
             verify=_legacy_verify(),
         )
@@ -159,12 +168,13 @@ def _try_legacy_stream(path: str, payload: dict, cookies: str | None = None) -> 
         return LegacyCallResult(False, path, error="legacy_base_url_missing")
     url = f"{base}{path}"
     try:
+        effective_cookie = _effective_legacy_cookie(cookies)
         log_stage(
             "skill.legacy_stream.request",
             {
                 "url": url,
                 "payload": payload,
-                "cookiePreview": mask_cookie(cookies),
+                "cookiePreview": mask_cookie(effective_cookie),
             },
             enabled=settings.debug_runtime_logs,
             max_chars=settings.debug_log_max_chars,
@@ -173,7 +183,7 @@ def _try_legacy_stream(path: str, payload: dict, cookies: str | None = None) -> 
         response = requests.post(
             url,
             json=payload,
-            headers={"Cookie": cookies or ""},
+            headers={"Cookie": effective_cookie},
             timeout=40,
             stream=True,
             verify=_legacy_verify(),
@@ -368,17 +378,46 @@ def _execute_skill_once(
     if skill_name == "retrieval":
         legacy = _try_legacy_json(
             "/report-agent/v1/document-material-retrieval",
-            {"query": prompt, "text": prompt, "keyword": prompt},
+            {
+                "query": prompt,
+                "title": "",
+                "datasetIds": [
+                    "a71e0236396711f1b6430242ac1e0009"
+                ],
+                "keywords": [],
+                "pageNo": 1,
+                "pageSize": 2
+            },
             cookies,
         )
         legacy_items: list[Any] = []
         if legacy.ok:
             body = legacy.payload if isinstance(legacy.payload, dict) else {}
-            raw_items = body.get("data") or body.get("rows") or body.get("list") or []
+            data_payload = body.get("data")
+            if isinstance(data_payload, dict):
+                raw_items = (
+                    data_payload.get("chunks")
+                    or data_payload.get("rows")
+                    or data_payload.get("list")
+                    or []
+                )
+            else:
+                raw_items = data_payload or body.get("rows") or body.get("list") or []
             if isinstance(raw_items, list):
                 legacy_items = raw_items
             elif raw_items is not None:
                 legacy_items = [raw_items]
+            log_stage(
+                "skill.retrieval.legacy_items",
+                {
+                    "legacyUrl": legacy.url,
+                    "itemsCount": len(legacy_items),
+                    "sampleItems": legacy_items[:3],
+                },
+                enabled=settings.debug_runtime_logs,
+                max_chars=settings.debug_log_max_chars,
+                max_string_chars=settings.debug_log_max_string_chars,
+            )
 
         # Legacy 返回 200 但 data/rows/list 为空时，若直接结束会导致 items 与 summary_text 皆空，
         # runtime 会触发「检索没有拿到有效结果」的 waiting_user，后续 writing 步骤永远不会执行。
@@ -435,6 +474,17 @@ def _execute_skill_once(
             {"title": "检索摘要", "summary": line}
             for line in [part.strip("- ").strip() for part in text.splitlines() if part.strip()][:5]
         ]
+        log_stage(
+            "skill.retrieval.fallback_items",
+            {
+                "sourceState": fallback_state,
+                "itemsCount": len(items),
+                "summaryTextPreview": (text or "")[:800],
+            },
+            enabled=settings.debug_runtime_logs,
+            max_chars=settings.debug_log_max_chars,
+            max_string_chars=settings.debug_log_max_string_chars,
+        )
         # 同步保留整段 LLM 兜底输出，供 build_handoff_content 作为完整背景资料下传给 writing 步骤。
         result = SkillExecutionResult(
             {
@@ -460,26 +510,16 @@ def _execute_skill_once(
         return result
 
     if skill_name == "writing":
-        legacy_text = _try_legacy_stream(
-            "/report-agent/v1/document-writing",
-            {"title": prompt[:20], "text": prompt, "prompt": prompt, "content": prompt},
-            cookies,
+        # 禁用 legacy writing：统一走模型通道，避免 legacy 未登录/网关异常被误当作正文。
+        text, source_state, error_detail, reasoning_content = _invoke_llm(
+            prompt,
+            skill_name,
+            requested_model,
+            runtime_context,
+            memory_context,
+            task_packet,
+            on_text_delta=on_text_delta,
         )
-        if legacy_text.ok and legacy_text.text:
-            text = legacy_text.text
-            source_state = "legacy_success"
-            error_detail = None
-            reasoning_content = None
-        else:
-            text, source_state, error_detail, reasoning_content = _invoke_llm(
-                prompt,
-                skill_name,
-                requested_model,
-                runtime_context,
-                memory_context,
-                task_packet,
-                on_text_delta=on_text_delta,
-            )
         # 公文正文强制纯文本：抽取 <正文>...</正文>、剥离 Markdown、去除寒暄与末尾客套。
         # 即使模型违规输出 Markdown，前端最终看到的也是可直接粘贴到 Word 的纯文本。
         if source_state in ("model_success", "legacy_success") and text:
@@ -498,7 +538,7 @@ def _execute_skill_once(
             [],
             source_state != "legacy_success",
             source_state=source_state,
-            error_detail=legacy_text.error or error_detail,
+            error_detail=error_detail,
             reasoning_content=reasoning_content,
         )
         log_stage(
