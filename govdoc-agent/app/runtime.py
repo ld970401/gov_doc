@@ -28,7 +28,6 @@ from .a2a_runtime import (
     title_for_skill,
 )
 from .event_payload import (
-    PLANNING_SUMMARY_TEXT_INDEX,
     PLANNING_THINKING_INDEX,
     display_text_for_step,
     done_label_for_skill,
@@ -953,7 +952,9 @@ def _plan_payload(plan) -> dict:
         # displayTitle：前端"待办任务列表"卡片主文案（短语），
         # 例：「检索写作参考资料」「起草 五一放假通知」。
         base_title = (step.title or "").strip() or "待执行任务"
-        display_title = base_title
+        objective = (step.objective or "").strip()
+        # 优先展示和用户问题更贴近的 objective 片段，让计划卡片语义更直观。
+        display_title = objective[:60] if objective else base_title
         running_label = display_text_for_step(step, phase="running")
         done_label = display_text_for_step(step, phase="done")
         steps_payload.append(
@@ -961,7 +962,7 @@ def _plan_payload(plan) -> dict:
                 "index": step.index,
                 "skillName": step.skill_name,
                 "title": base_title,
-                "objective": step.objective,
+                "objective": objective,
                 "scope": step.scope,
                 "dependsOn": step.depends_on,
                 "subtaskRole": step.subtask_role,
@@ -1514,9 +1515,9 @@ def _extract_synthetic_text(skill_name: str, skill_result: SkillExecutionResult)
             if not isinstance(item, dict):
                 continue
             title = (item.get("title") or item.get("name") or "资料").strip()
-            summary = (item.get("summary") or item.get("content") or "").strip()
-            if summary:
-                lines.append(f"- {title}: {summary}")
+            description = (item.get("description") or item.get("summary") or item.get("content") or "").strip()
+            if description:
+                lines.append(f"- {title}: {description}")
             else:
                 lines.append(f"- {title}")
         if lines:
@@ -2039,42 +2040,29 @@ def run_conversation(
     if planning_pre_events is not None:
         runtime_events = planning_pre_events
         saved_events_count = planning_saved_count
-        runtime_events.extend(
-            [
+        has_planning_thinking_start = any(
+            ev.type == "content_block_start" and ev.index == PLANNING_THINKING_INDEX
+            for ev in runtime_events
+        )
+        if has_planning_thinking_start:
+            runtime_events.append(
                 RuntimeTaskEvent(
                     type="content_block_stop",
                     index=PLANNING_THINKING_INDEX,
-                ),
-                RuntimeTaskEvent(
-                    type="content_block_start",
-                    index=PLANNING_SUMMARY_TEXT_INDEX,
-                    content_block={
-                        "type": "text",
-                        "purpose": "plan_summary",
-                        "displayText": "规划完成",
-                    },
-                ),
-                RuntimeTaskEvent(
-                    type="content_block_delta",
-                    index=PLANNING_SUMMARY_TEXT_INDEX,
-                    delta={"type": "text_delta", "text": "已完成执行计划生成与校验。"},
-                ),
-                RuntimeTaskEvent(
-                    type="content_block_stop",
-                    index=PLANNING_SUMMARY_TEXT_INDEX,
-                ),
-                RuntimeTaskEvent(
-                    type="tool_result",
-                    payload={
-                        "tool": "a2a_planning",
-                        "steps": len(plan.steps),
-                        "taskPacket": packet.model_dump(),
-                        "plan": _plan_payload(plan),
-                        "plannerMeta": planner_meta,
-                        "displayText": f"已规划 {len(plan.steps)} 个执行步骤",
-                    },
-                ),
-            ]
+                )
+            )
+        runtime_events.append(
+            RuntimeTaskEvent(
+                type="tool_result",
+                payload={
+                    "tool": "a2a_planning",
+                    "steps": len(plan.steps),
+                    "taskPacket": packet.model_dump(),
+                    "plan": _plan_payload(plan),
+                    "plannerMeta": planner_meta,
+                    "displayText": f"已规划 {len(plan.steps)} 个执行步骤",
+                },
+            )
         )
     else:
         runtime_events = [

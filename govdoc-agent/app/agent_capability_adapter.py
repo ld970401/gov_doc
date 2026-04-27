@@ -1,5 +1,6 @@
 import json
 import time
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from html import escape
@@ -93,6 +94,45 @@ def _read_sse_text(response: requests.Response) -> str:
         else:
             chunks.append(line)
     return "\n".join(chunks).strip()
+
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html_text(value: Any) -> str:
+    text = str(value or "")
+    return _HTML_TAG_RE.sub("", text).replace("\r\n", "\n").strip()
+
+
+def _normalize_retrieval_items(raw_items: list[Any], *, limit: int = 8) -> list[dict[str, str]]:
+    """将检索原始返回归一为 [{title, description}]，并按稳定顺序去重。"""
+    normalized: list[dict[str, str]] = []
+    seen_keys: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        title = (
+            str(item.get("document_keyword") or item.get("title") or item.get("dataset_name") or "检索资料")
+            .strip()
+        )
+        description = _strip_html_text(item.get("highlight") or item.get("content") or item.get("summary"))
+        if not description:
+            description = "暂无摘要。"
+        if len(description) > 240:
+            description = description[:240] + "…"
+        identity = (
+            str(item.get("id") or "").strip()
+            or str(item.get("document_id") or "").strip()
+            or f"{title}|{description[:120]}"
+        )
+        dedup_key = identity.lower()
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+        normalized.append({"title": title, "description": description})
+        if len(normalized) >= max(limit, 1):
+            break
+    return normalized
 
 
 def _try_legacy_json(path: str, payload: dict, cookies: str | None = None) -> LegacyCallResult:
@@ -423,12 +463,17 @@ def _execute_skill_once(
         # runtime 会触发「检索没有拿到有效结果」的 waiting_user，后续 writing 步骤永远不会执行。
         # 与接口失败同等处理：走 LLM 兜底，至少产出 summary_text 供 handoff 与写作使用。
         if legacy.ok and legacy_items:
-            normalized = {"items": legacy_items, "source": _normalized_source("legacy_success")}
+            normalized_items = _normalize_retrieval_items(legacy_items)
+            normalized = {"items": normalized_items, "source": _normalized_source("legacy_success")}
             render_blocks = [
                 {
                     "type": "summary",
                     "title": "检索结果",
-                    "html": text_to_html(json.dumps(legacy_items[:5], ensure_ascii=False)),
+                    "html": text_to_html(
+                        "\n".join(
+                            f"- {item['title']}: {item['description']}" for item in normalized_items
+                        )
+                    ),
                 }
             ]
             result = SkillExecutionResult(
@@ -471,7 +516,7 @@ def _execute_skill_once(
             on_text_delta=on_text_delta,
         )
         items = [
-            {"title": "检索摘要", "summary": line}
+            {"title": "检索摘要", "description": line}
             for line in [part.strip("- ").strip() for part in text.splitlines() if part.strip()][:5]
         ]
         log_stage(

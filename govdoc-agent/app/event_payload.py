@@ -89,8 +89,10 @@ def display_text_for_step(step: ExecutionStep, *, phase: str = "running") -> str
             return f"{base} · {title}"
         return base
     action = action_label_for_skill(skill)
-    target = title or "当前任务"
-    return f"正在{action} {target}".strip()
+    objective = (step.objective or "").strip()
+    # 运行态优先使用 objective 摘要（与 displayTitle 一致），避免"正在检索 资料检索"这类词义重复。
+    target = (objective.splitlines()[0].strip()[:60] if objective else title) or "当前任务"
+    return f"正在{action}：{target}".strip()
 
 
 # --- 瘦身白名单 --------------------------------------------------------------
@@ -208,10 +210,10 @@ def _slim_normalized_result(skill_name: str | None, result: Any) -> Any:
 
 def _slim_retrieval_item(item: dict[str, Any]) -> dict[str, Any]:
     title = item.get("title") or item.get("name") or "资料"
-    summary = item.get("summary") or item.get("content") or ""
+    summary = item.get("description") or item.get("summary") or item.get("content") or ""
     if isinstance(summary, str) and len(summary) > 240:
         summary = summary[:240] + "…"
-    out: dict[str, Any] = {"title": title, "summary": summary}
+    out: dict[str, Any] = {"title": title, "description": summary}
     if item.get("source"):
         out["source"] = item["source"]
     if item.get("url"):

@@ -286,19 +286,45 @@ def stream_events(
                 for event in events:
                     output = {
                         "type": event.event_type,
-                        "seqNo": event.seq_no,
-                        "createdAt": event.created_at.isoformat(),
                     }
-                    if event.event_index:
-                        output["index"] = event.event_index
                     if event.event_type == "content_block_start" and event.block_json:
-                        output["content_block"] = json.loads(event.block_json)
+                        block = json.loads(event.block_json)
+                        if isinstance(block, dict):
+                            block.pop("stepIndex", None)
+                            block.pop("stepTitle", None)
+                            block.pop("name", None)
+                        output["content_block"] = block
                     elif event.event_type == "content_block_delta" and event.delta_json:
                         output["delta"] = json.loads(event.delta_json)
                     elif event.event_type == "tool_result" and event.payload_json:
-                        output["payload"] = json.loads(event.payload_json)
-                    elif event.event_type == "message_start" and event.payload_json:
-                        output["payload"] = json.loads(event.payload_json)
+                        payload = json.loads(event.payload_json)
+                        if isinstance(payload, dict):
+                            payload.pop("plannerMeta", None)
+                            payload.pop("taskId", None)
+                            payload.pop("parentTaskId", None)
+                            if payload.get("tool") == "a2a_planning":
+                                plan = payload.get("plan")
+                                if isinstance(plan, dict):
+                                    for key in ("summary", "requiresUserInput", "clarificationQuestion"):
+                                        plan.pop(key, None)
+                                    steps = plan.get("steps")
+                                    if isinstance(steps, list):
+                                        for step in steps:
+                                            if not isinstance(step, dict):
+                                                continue
+                                            for key in (
+                                                "title",
+                                                "displayTitle",
+                                                "actionLabel",
+                                                "pendingLabel",
+                                                "runningLabel",
+                                                "doneLabel",
+                                            ):
+                                                step.pop(key, None)
+                        output["payload"] = payload
+                    elif event.event_type == "message_start":
+                        # 需求：首条 message_start 不回传 payload
+                        pass
                     elif event.event_type == "message_delta" and event.payload_json:
                         output["payload"] = json.loads(event.payload_json)
                     elif event.event_type == "waiting_user" and event.payload_json:
@@ -306,7 +332,11 @@ def stream_events(
                     elif event.event_type == "error" and event.payload_json:
                         output["payload"] = json.loads(event.payload_json)
                     elif event.event_type == "running" and event.payload_json:
-                        output["payload"] = json.loads(event.payload_json)
+                        payload = json.loads(event.payload_json)
+                        if isinstance(payload, dict):
+                            payload.pop("taskId", None)
+                            payload.pop("parentTaskId", None)
+                        output["payload"] = payload
                     yield "data: " + json.dumps(output, ensure_ascii=False) + "\n\n"
                     sent_seq_no = event.seq_no
                     last_heartbeat = time.monotonic()
