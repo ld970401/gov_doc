@@ -28,6 +28,7 @@ from .a2a_runtime import (
     title_for_skill,
 )
 from .event_payload import (
+    PLANNING_SUMMARY_TEXT_INDEX,
     PLANNING_THINKING_INDEX,
     display_text_for_step,
     done_label_for_skill,
@@ -2037,6 +2038,27 @@ def run_conversation(
         db.add(run)
     db.flush()
 
+    planning_tool_use_index = PLANNING_SUMMARY_TEXT_INDEX
+    planning_public_plan_payload = _plan_payload(plan)
+    planning_public_plan_payload.pop("requiresUserInput", None)
+    planning_public_plan_payload.pop("clarificationQuestion", None)
+    for step_item in planning_public_plan_payload.get("steps") or []:
+        if not isinstance(step_item, dict):
+            continue
+        step_item.pop("objective", None)
+        step_item.pop("actionLabel", None)
+        step_item.pop("pendingLabel", None)
+        step_item.pop("runningLabel", None)
+        step_item.pop("doneLabel", None)
+        step_item.pop("status", None)
+    planning_tool_result_payload = {
+        "tool": "a2a_planning",
+        "steps": len(plan.steps),
+        "taskPacket": packet.model_dump(),
+        "plan": planning_public_plan_payload,
+        "displayText": f"已规划 {len(plan.steps)} 个执行步骤",
+    }
+
     if planning_pre_events is not None:
         runtime_events = planning_pre_events
         saved_events_count = planning_saved_count
@@ -2053,15 +2075,23 @@ def run_conversation(
             )
         runtime_events.append(
             RuntimeTaskEvent(
-                type="tool_result",
-                payload={
-                    "tool": "a2a_planning",
-                    "steps": len(plan.steps),
-                    "taskPacket": packet.model_dump(),
-                    "plan": _plan_payload(plan),
-                    "plannerMeta": planner_meta,
-                    "displayText": f"已规划 {len(plan.steps)} 个执行步骤",
+                type="content_block_start",
+                index=planning_tool_use_index,
+                content_block={
+                    "type": "tool_use",
+                    "name": "a2a_planning",
+                    "skillName": "a2a_planning",
+                    "stepIndex": 0,
+                    "stepTitle": "执行规划",
+                    "displayText": "进行中：执行规划",
                 },
+            )
+        )
+        runtime_events.append(
+            RuntimeTaskEvent(
+                type="content_block_stop",
+                index=planning_tool_use_index,
+                payload=planning_tool_result_payload,
             )
         )
     else:
@@ -2090,15 +2120,21 @@ def run_conversation(
                 index=PLANNING_THINKING_INDEX,
             ),
             RuntimeTaskEvent(
-                type="tool_result",
-                payload={
-                    "tool": "a2a_planning",
-                    "steps": len(plan.steps),
-                    "taskPacket": packet.model_dump(),
-                    "plan": _plan_payload(plan),
-                    "plannerMeta": planner_meta,
-                    "displayText": f"已规划 {len(plan.steps)} 个执行步骤",
+                type="content_block_start",
+                index=planning_tool_use_index,
+                content_block={
+                    "type": "tool_use",
+                    "name": "a2a_planning",
+                    "skillName": "a2a_planning",
+                    "stepIndex": 0,
+                    "stepTitle": "执行规划",
+                    "displayText": "进行中：执行规划",
                 },
+            ),
+            RuntimeTaskEvent(
+                type="content_block_stop",
+                index=planning_tool_use_index,
+                payload=planning_tool_result_payload,
             ),
         ]
         saved_events_count = 0
@@ -2553,7 +2589,7 @@ def run_conversation(
             tool_name = "main_agent" if is_main_agent_step else step.skill_name
 
             compact_stream = step.skill_name in {"retrieval"}
-            text_only_stream = step.skill_name in {"writing"}
+            text_only_stream = step.skill_name in {"writing","general"}
             # 检索步骤采用紧凑事件：仅保留 tool_use start/stop，不再推送 input_json_delta 与 running。
             # 写作步骤仅保留 text start/delta/stop 一套事件，避免与 tool_use 形成双轨重复。
             if compact_stream:
