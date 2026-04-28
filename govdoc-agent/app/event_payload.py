@@ -84,14 +84,14 @@ def display_text_for_step(step: ExecutionStep, *, phase: str = "running") -> str
     skill = (step.skill_name or "").strip().lower()
     title = (step.title or "").strip()
     if phase == "done":
-        base = done_label_for_skill(skill)
-        if title and title not in base:
-            return f"{base} · {title}"
-        return base
+        if title:
+            return f"已完成：{title}"
+        return done_label_for_skill(skill)
     action = action_label_for_skill(skill)
+    if title:
+        return f"进行中：{title}"
     objective = (step.objective or "").strip()
-    # 运行态优先使用 objective 摘要（与 displayTitle 一致），避免"正在检索 资料检索"这类词义重复。
-    target = (objective.splitlines()[0].strip()[:60] if objective else title) or "当前任务"
+    target = (objective.splitlines()[0].strip()[:60] if objective else "") or "当前任务"
     return f"正在{action}：{target}".strip()
 
 

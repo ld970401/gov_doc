@@ -2122,6 +2122,8 @@ def run_conversation(
         """
         text_index = text_index_for_step(step.index)
         purpose = purpose_for_skill(step.skill_name)
+        tool_name = "main_agent" if step.subtask_role == "main_agent" else step.skill_name
+        running_display = display_text_for_step(step, phase="running")
         state = {
             "started": False,
             "stopped": False,
@@ -2155,6 +2157,8 @@ def run_conversation(
                             content_block={
                                 "type": "text",
                                 "purpose": purpose,
+                                "name": tool_name,
+                                "displayText": running_display,
                                 "stepIndex": step.index,
                                 "stepTitle": step.title,
                                 "skillName": step.skill_name,
@@ -2171,13 +2175,15 @@ def run_conversation(
                 state["last_flush_len"] = n
                 state["last_flush_t"] = now
             if is_final and state["started"] and not state["stopped"]:
-                state["stopped"] = True
-                push(
-                    RuntimeTaskEvent(
-                        type="content_block_stop",
-                        index=text_index,
+                # writing 步骤的最终 stop 需携带完整 payload，统一在主流程拿到 skill_result 后再发送。
+                if step.skill_name != "writing":
+                    state["stopped"] = True
+                    push(
+                        RuntimeTaskEvent(
+                            type="content_block_stop",
+                            index=text_index,
+                        )
                     )
-                )
 
         def has_started() -> bool:
             return state["started"]
@@ -2280,12 +2286,6 @@ def run_conversation(
         if pending_state and not model_error_pending:
             push_event(
                 RuntimeTaskEvent(
-                    type="message_delta",
-                    payload={"delta": {"stop_reason": "end_turn"}},
-                )
-            )
-            push_event(
-                RuntimeTaskEvent(
                     type="waiting_user",
                     payload={
                         "taskId": pending_state.get("taskId"),
@@ -2304,12 +2304,6 @@ def run_conversation(
             # 模型失败场景直接结束流，不再额外下发 waiting_user / end_turn。
             push_event(RuntimeTaskEvent(type="message_stop"))
         else:
-            push_event(
-                RuntimeTaskEvent(
-                    type="message_delta",
-                    payload={"delta": {"stop_reason": "end_turn"}},
-                )
-            )
             push_event(RuntimeTaskEvent(type="message_stop"))
         return {
             "run": run,
@@ -2382,12 +2376,6 @@ def run_conversation(
             },
         )
         db.commit()
-        push_event(
-            RuntimeTaskEvent(
-                type="message_delta",
-                payload={"delta": {"stop_reason": "end_turn"}},
-            )
-        )
         error_payload: dict[str, Any] = {
             "errorDetail": failure_text,
             "assistantMessageId": assistant_message.id,
@@ -2565,8 +2553,9 @@ def run_conversation(
             tool_name = "main_agent" if is_main_agent_step else step.skill_name
 
             compact_stream = step.skill_name in {"retrieval"}
+            text_only_stream = step.skill_name in {"writing"}
             # 检索步骤采用紧凑事件：仅保留 tool_use start/stop，不再推送 input_json_delta 与 running。
-            # 写作步骤保留 text_delta 流式，便于前端边生成边渲染正文。
+            # 写作步骤仅保留 text start/delta/stop 一套事件，避免与 tool_use 形成双轨重复。
             if compact_stream:
                 safe_push(
                     RuntimeTaskEvent(
@@ -2582,7 +2571,7 @@ def run_conversation(
                         },
                     )
                 )
-            else:
+            elif not text_only_stream:
                 safe_push(
                     RuntimeTaskEvent(
                         type="content_block_start",
@@ -2686,6 +2675,8 @@ def run_conversation(
                             content_block={
                                 "type": "text",
                                 "purpose": purpose,
+                                "name": tool_name,
+                                "displayText": running_display,
                                 "stepIndex": step.index,
                                 "stepTitle": step.title,
                                 "skillName": step.skill_name,
@@ -2721,12 +2712,13 @@ def run_conversation(
                                 delta={"type": "text_delta", "text": synthetic_text},
                             )
                         )
-                        safe_push(
-                            RuntimeTaskEvent(
-                                type="content_block_stop",
-                                index=text_index,
+                        if step.skill_name != "writing":
+                            safe_push(
+                                RuntimeTaskEvent(
+                                    type="content_block_stop",
+                                    index=text_index,
+                                )
                             )
-                        )
 
             step_html = render_assistant_html(step.skill_name, skill_result, requested_model or "")
             step_summary = skill_result.render_blocks[0].get("title") if skill_result.render_blocks else title_for_skill(step.skill_name)
@@ -2748,7 +2740,15 @@ def run_conversation(
                 "sourceState": skill_result.source_state,
                 "errorDetail": skill_result.error_detail,
             }
-            if compact_stream:
+            if text_only_stream:
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="content_block_stop",
+                        index=text_index,
+                        payload=tool_result_payload,
+                    )
+                )
+            elif compact_stream:
                 safe_push(
                     RuntimeTaskEvent(
                         type="content_block_stop",
