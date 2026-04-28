@@ -281,6 +281,35 @@ def _coerce_delta_text(value: Any) -> str:
     return ""
 
 
+def _coerce_choice_text(choice: dict[str, Any]) -> str:
+    """从单个 choice 中尽可能提取文本，兼容非标准网关字段。"""
+    if not isinstance(choice, dict):
+        return ""
+    message = choice.get("message")
+    if isinstance(message, dict):
+        msg_text = _coerce_message_text(message)
+        if msg_text:
+            return msg_text
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        delta_text = _coerce_delta_text(
+            delta.get("content")
+            or delta.get("text")
+            or delta.get("output_text")
+        )
+        if delta_text:
+            return delta_text
+    for key in ("text", "output_text", "content"):
+        raw = choice.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw
+        if isinstance(raw, list):
+            list_text = _coerce_delta_text(raw)
+            if list_text:
+                return list_text
+    return ""
+
+
 # 辅助函数：合并工具调用块
 def _merge_tool_call_chunks(existing: list[dict], delta_calls: list[dict]) -> list[dict]:
     """合并工具调用块，处理流式响应中的工具调用信息。"""
@@ -447,8 +476,13 @@ def call_chat_model_with_messages_raw(
                 if not choices:
                     continue
 
-                delta = choices[0].get("delta") or {}
+                choice0 = choices[0] if isinstance(choices[0], dict) else {}
+                delta = choice0.get("delta") or {}
                 delta_text = _coerce_delta_text(delta.get("content"))
+                if not delta_text:
+                    delta_text = _coerce_delta_text(delta.get("text") or delta.get("output_text"))
+                if not delta_text:
+                    delta_text = _coerce_choice_text(choice0)
                 delta_reasoning = _coerce_delta_text(
                     delta.get("reasoning_content") or delta.get("reasoning") or delta.get("reasoningContent")
                 )
@@ -484,8 +518,9 @@ def call_chat_model_with_messages_raw(
                                 "index": 1,
                                 "content_block": {"type": "text"},
                             })
+                    # 无论是否向上游透传流式事件，都必须累积正文；否则 compact 模式会被误判为空响应。
+                    text_parts.append(delta_text)
                     if on_stream_event:
-                        text_parts.append(delta_text)
                         on_stream_event({
                             "type": "content_block_delta",
                             "index": 1,
@@ -533,6 +568,19 @@ def call_chat_model_with_messages_raw(
 
             text = "".join(text_parts).strip()
             reasoning_content = "".join(reasoning_parts).strip()
+            # 某些兼容网关在 stream 模式不走标准 delta.content，而只在 choice.message/text 回传正文。
+            # 若增量拼接结果为空，回退到 chunks 中做一次聚合提取，避免误判为“模型返回内容为空”。
+            if not text:
+                fallback_parts: list[str] = []
+                for chunk in chunks:
+                    chunk_choices = chunk.get("choices") or []
+                    if not chunk_choices:
+                        continue
+                    piece = _coerce_choice_text(chunk_choices[0])
+                    if piece:
+                        fallback_parts.append(piece)
+                if fallback_parts:
+                    text = "".join(fallback_parts).strip()
             message = {
                 "role": "assistant",
                 "content": text,

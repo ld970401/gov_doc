@@ -94,6 +94,27 @@ class TestEventPayloadSlimming(unittest.TestCase):
         self.assertEqual(slim["normalizedResult"]["itemsTotal"], 20)
         self.assertLessEqual(len(slim["normalizedResult"]["items"]), 5)
 
+    def test_content_block_stop_payload_slims_like_tool_result(self) -> None:
+        full_payload = {
+            "tool": "retrieval",
+            "taskId": "t1",
+            "skillName": "retrieval",
+            "stepIndex": 1,
+            "stepTitle": "资料检索",
+            "displayText": "检索完成",
+            "normalizedResult": {
+                "items": [{"title": f"item-{i}", "description": "y" * 500} for i in range(20)],
+                "source": "legacy_success",
+            },
+            "retryable": False,
+            "sourceState": "legacy_success",
+            "errorDetail": None,
+        }
+        slim = slim_payload("content_block_stop", full_payload)
+        self.assertEqual(slim["skillName"], "retrieval")
+        self.assertEqual(slim["normalizedResult"]["itemsTotal"], 20)
+        self.assertLessEqual(len(slim["normalizedResult"]["items"]), 5)
+
     def test_message_start_slim_picks_task_id_from_packet(self) -> None:
         payload = {"taskPacket": {"task_id": "abc", "skill_name": "writing"}}
         slim = slim_payload("message_start", payload)

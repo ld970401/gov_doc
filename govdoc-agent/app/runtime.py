@@ -2273,7 +2273,11 @@ def run_conversation(
             requested_model,
         )
         db.commit()
-        if pending_state:
+        model_error_pending = (
+            isinstance(pending_state, dict)
+            and (pending_state.get("sourceState") == "model_error")
+        )
+        if pending_state and not model_error_pending:
             push_event(
                 RuntimeTaskEvent(
                     type="message_delta",
@@ -2295,6 +2299,9 @@ def run_conversation(
                     },
                 )
             )
+            push_event(RuntimeTaskEvent(type="message_stop"))
+        elif model_error_pending:
+            # 模型失败场景直接结束流，不再额外下发 waiting_user / end_turn。
             push_event(RuntimeTaskEvent(type="message_stop"))
         else:
             push_event(
@@ -2557,57 +2564,77 @@ def run_conversation(
             done_display = display_text_for_step(step, phase="done")
             tool_name = "main_agent" if is_main_agent_step else step.skill_name
 
-            safe_push(
-                RuntimeTaskEvent(
-                    type="content_block_start",
-                    index=tool_use_index,
-                    content_block={
-                        "type": "tool_use",
-                        "name": tool_name,
-                        "skillName": step.skill_name,
-                        "stepIndex": step.index,
-                        "stepTitle": step.title,
-                        "displayText": running_display,
-                    },
+            compact_stream = step.skill_name in {"retrieval"}
+            # 检索步骤采用紧凑事件：仅保留 tool_use start/stop，不再推送 input_json_delta 与 running。
+            # 写作步骤保留 text_delta 流式，便于前端边生成边渲染正文。
+            if compact_stream:
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="content_block_start",
+                        index=tool_use_index,
+                        content_block={
+                            "type": "tool_use",
+                            "name": tool_name,
+                            "skillName": step.skill_name,
+                            "stepIndex": step.index,
+                            "stepTitle": step.title,
+                            "displayText": running_display,
+                        },
+                    )
                 )
-            )
-            safe_push(
-                RuntimeTaskEvent(
-                    type="content_block_delta",
-                    index=tool_use_index,
-                    delta={
-                        "type": "input_json_delta",
-                        "partial_json": json.dumps({
-                            "subtask": subtask_id,
-                            "skill": step.skill_name,
-                            "depends_on": step.depends_on or [],
-                            "objective": step.objective,
-                        }, ensure_ascii=False),
-                    },
+            else:
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="content_block_start",
+                        index=tool_use_index,
+                        content_block={
+                            "type": "tool_use",
+                            "name": tool_name,
+                            "skillName": step.skill_name,
+                            "stepIndex": step.index,
+                            "stepTitle": step.title,
+                            "displayText": running_display,
+                        },
+                    )
                 )
-            )
-            safe_push(
-                RuntimeTaskEvent(
-                    type="content_block_stop",
-                    index=tool_use_index,
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="content_block_delta",
+                        index=tool_use_index,
+                        delta={
+                            "type": "input_json_delta",
+                            "partial_json": json.dumps({
+                                "subtask": subtask_id,
+                                "skill": step.skill_name,
+                                "depends_on": step.depends_on or [],
+                                "objective": step.objective,
+                            }, ensure_ascii=False),
+                        },
+                    )
                 )
-            )
-            safe_push(
-                RuntimeTaskEvent(
-                    type="running",
-                    payload={
-                        "taskId": subtask_id,
-                        "parentTaskId": task_id,
-                        "taskPacket": subtask_packet.model_dump(),
-                        "skillName": step.skill_name,
-                        "stepIndex": step.index,
-                        "stepTitle": step.title,
-                        "displayText": running_display,
-                    },
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="content_block_stop",
+                        index=tool_use_index,
+                    )
                 )
-            )
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="running",
+                        payload={
+                            "taskId": subtask_id,
+                            "parentTaskId": task_id,
+                            "taskPacket": subtask_packet.model_dump(),
+                            "skillName": step.skill_name,
+                            "stepIndex": step.index,
+                            "stepTitle": step.title,
+                            "displayText": running_display,
+                        },
+                    )
+                )
 
             step_stream_cb, stream_has_started = make_step_stream_callback(step, safe_push)
+            stream_callback = None if compact_stream else step_stream_cb
 
             if is_main_agent_step and pending_direct_answer:
                 skill_result = SkillExecutionResult(
@@ -2630,7 +2657,7 @@ def run_conversation(
                     runtime_context=runtime_context,
                     memory_context=memory_context,
                     task_packet=subtask_packet.model_dump(),
-                    on_text_delta=step_stream_cb,
+                    on_text_delta=stream_callback,
                 )
             else:
                 skill_result = agent_tool.call(
@@ -2642,12 +2669,13 @@ def run_conversation(
                     runtime_context=runtime_context,
                     memory_context=memory_context,
                     task_packet=subtask_packet.model_dump(),
-                    on_text_delta=step_stream_cb,
+                    on_text_delta=stream_callback,
                 )
 
             # 如果本步骤未走流式通道（例如 retrieval/writing 的 legacy JSON 成功），
             # 但仍有可展示的正文/摘要，则补发一次合成的 text 块，便于前端编辑器联动。
-            if not stream_has_started():
+            retrieval_summary_on_stop = False
+            if not compact_stream and not stream_has_started():
                 synthetic_text = _extract_synthetic_text(step.skill_name, skill_result)
                 if synthetic_text:
                     purpose = purpose_for_skill(step.skill_name)
@@ -2664,19 +2692,41 @@ def run_conversation(
                             },
                         )
                     )
-                    safe_push(
-                        RuntimeTaskEvent(
-                            type="content_block_delta",
-                            index=text_index,
-                            delta={"type": "text_delta", "text": synthetic_text},
+                    # 检索 legacy：跳过大段 text_delta（与 normalizedResult 重复），在 stop 上挂结构化 payload 瘦身 SSE
+                    if step.skill_name == "retrieval":
+                        retrieval_summary_on_stop = True
+                        safe_push(
+                            RuntimeTaskEvent(
+                                type="content_block_stop",
+                                index=text_index,
+                                payload={
+                                    "tool": tool_name,
+                                    "taskId": subtask_id,
+                                    "skillName": step.skill_name,
+                                    "stepIndex": step.index,
+                                    "stepTitle": step.title,
+                                    "displayText": done_display,
+                                    "retryable": skill_result.retryable,
+                                    "sourceState": skill_result.source_state,
+                                    "errorDetail": skill_result.error_detail,
+                                    "normalizedResult": skill_result.normalized_result,
+                                },
+                            )
                         )
-                    )
-                    safe_push(
-                        RuntimeTaskEvent(
-                            type="content_block_stop",
-                            index=text_index,
+                    else:
+                        safe_push(
+                            RuntimeTaskEvent(
+                                type="content_block_delta",
+                                index=text_index,
+                                delta={"type": "text_delta", "text": synthetic_text},
+                            )
                         )
-                    )
+                        safe_push(
+                            RuntimeTaskEvent(
+                                type="content_block_stop",
+                                index=text_index,
+                            )
+                        )
 
             step_html = render_assistant_html(step.skill_name, skill_result, requested_model or "")
             step_summary = skill_result.render_blocks[0].get("title") if skill_result.render_blocks else title_for_skill(step.skill_name)
@@ -2686,23 +2736,41 @@ def run_conversation(
                 json.dumps(skill_result.normalized_result, ensure_ascii=False),
             )
             a2a_task_registry.set_status(subtask_id, TASK_STATUS_COMPLETED)
-            safe_push(
-                RuntimeTaskEvent(
-                    type="tool_result",
-                    payload={
-                        "tool": tool_name,
-                        "taskId": subtask_id,
-                        "skillName": step.skill_name,
-                        "stepIndex": step.index,
-                        "stepTitle": step.title,
-                        "displayText": done_display,
-                        "normalizedResult": skill_result.normalized_result,
-                        "retryable": skill_result.retryable,
-                        "sourceState": skill_result.source_state,
-                        "errorDetail": skill_result.error_detail,
-                    },
+            tool_result_payload: dict[str, Any] = {
+                "tool": tool_name,
+                "taskId": subtask_id,
+                "skillName": step.skill_name,
+                "stepIndex": step.index,
+                "stepTitle": step.title,
+                "displayText": done_display,
+                "normalizedResult": skill_result.normalized_result,
+                "retryable": skill_result.retryable,
+                "sourceState": skill_result.source_state,
+                "errorDetail": skill_result.error_detail,
+            }
+            if compact_stream:
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="content_block_stop",
+                        index=tool_use_index,
+                        payload=tool_result_payload,
+                    )
                 )
-            )
+            elif retrieval_summary_on_stop:
+                tool_result_payload.pop("normalizedResult", None)
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="tool_result",
+                        payload=tool_result_payload,
+                    )
+                )
+            else:
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="tool_result",
+                        payload=tool_result_payload,
+                    )
+                )
             step_outcomes.append(
                 {
                     "index": step.index,

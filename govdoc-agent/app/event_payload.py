@@ -166,11 +166,8 @@ def _slim_normalized_result(skill_name: str | None, result: Any) -> Any:
             slim["itemsTotal"] = len(items)
         return slim
     if skill == "writing":
-        doc = result.get("document")
-        if isinstance(doc, str):
-            slim["documentPreview"] = doc[:400]
-            slim["documentLength"] = len(doc)
-        return slim
+        # 写作结果用于前端直接落稿，保留完整正文
+        return result
     if skill == "review":
         issues = result.get("issues") or []
         if isinstance(issues, list):
@@ -355,6 +352,8 @@ def slim_delta(event_type: str, delta: dict[str, Any] | None) -> dict[str, Any] 
 _PAYLOAD_SLIMMERS: dict[str, Any] = {
     "message_start": slim_message_start_payload,
     "tool_result": slim_tool_result_payload,
+    # 检索等 legacy 合成路径：正文在 content_block_stop.payload，与 tool_result 白名单一致以便落库瘦身
+    "content_block_stop": slim_tool_result_payload,
     "running": slim_running_payload,
     "waiting_user": slim_waiting_user_payload,
     "error": slim_error_payload,

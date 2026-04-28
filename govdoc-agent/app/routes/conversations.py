@@ -296,6 +296,12 @@ def stream_events(
                         output["content_block"] = block
                     elif event.event_type == "content_block_delta" and event.delta_json:
                         output["delta"] = json.loads(event.delta_json)
+                    elif event.event_type == "content_block_stop" and event.payload_json:
+                        payload = json.loads(event.payload_json)
+                        if isinstance(payload, dict):
+                            payload.pop("taskId", None)
+                            payload.pop("parentTaskId", None)
+                        output["payload"] = payload
                     elif event.event_type == "tool_result" and event.payload_json:
                         payload = json.loads(event.payload_json)
                         if isinstance(payload, dict):
