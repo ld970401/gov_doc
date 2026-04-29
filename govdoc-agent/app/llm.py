@@ -10,6 +10,7 @@ LLM 模型调用封装模块。
 """
 
 import json  # 用于处理 JSON 数据
+import re
 from html import escape  # 用于 HTML 转义，防止 XSS 攻击
 from typing import Any, Callable  # 类型注解，提高代码可读性
 
@@ -34,6 +35,90 @@ MODEL_ALIASES = {
 class LLMCallError(RuntimeError):
     """LLM 调用异常类，用于表示模型调用过程中的错误。"""
     pass
+
+
+# 私有化网关有时把函数调用塞进 message.content：<tool_call>{"name":...}</tool_call>
+# 且不填充标准 message.tool_calls，这里在非流式/流式汇总后做一次兼容回填。
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>", re.IGNORECASE)
+
+
+def _extract_tool_calls_from_text(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """从 content 中解析 <tool_call> JSON；返回剔除块后的正文与合成的 tool_calls。"""
+    if not isinstance(text, str) or "<tool_call" not in text.lower():
+        return text, []
+
+    parsed_calls: list[dict[str, Any]] = []
+    for index, match in enumerate(_TOOL_CALL_BLOCK_RE.finditer(text), start=1):
+        raw_json = (match.group(1) or "").strip()
+        if not raw_json:
+            continue
+        try:
+            payload = json.loads(raw_json)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            continue
+        arguments = payload.get("arguments")
+        if isinstance(arguments, str):
+            arguments_text = arguments
+        elif isinstance(arguments, dict):
+            arguments_text = json.dumps(arguments, ensure_ascii=False)
+        else:
+            arguments_text = "{}"
+
+        parsed_calls.append(
+            {
+                "id": f"compat_tool_call_{index}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments_text,
+                },
+            }
+        )
+
+    cleaned_text = _TOOL_CALL_BLOCK_RE.sub("", text).strip()
+    return cleaned_text, parsed_calls
+
+
+def _normalize_compat_tool_calls(message: dict[str, Any]) -> None:
+    """将 legacy function_call / <tool_call> 文本回填为 OpenAI-style tool_calls（原地修改 message）。"""
+    existing = message.get("tool_calls") or []
+    if isinstance(existing, list) and existing:
+        return
+
+    function_call = message.get("function_call") or {}
+    if isinstance(function_call, dict):
+        fname = str(function_call.get("name") or "").strip()
+        if fname:
+            fargs = function_call.get("arguments")
+            if isinstance(fargs, str):
+                arguments_text = fargs
+            elif isinstance(fargs, dict):
+                arguments_text = json.dumps(fargs, ensure_ascii=False)
+            else:
+                arguments_text = "{}"
+            message["tool_calls"] = [
+                {
+                    "id": "compat_function_call_1",
+                    "type": "function",
+                    "function": {
+                        "name": fname,
+                        "arguments": arguments_text,
+                    },
+                }
+            ]
+            return
+
+    content = message.get("content")
+    if isinstance(content, str) and "<tool_call" in content.lower():
+        cleaned, calls = _extract_tool_calls_from_text(content)
+        if calls:
+            message["content"] = cleaned
+            message["tool_calls"] = calls
 
 
 def _is_qwen_family(model_name: str | None) -> bool:
@@ -588,6 +673,7 @@ def call_chat_model_with_messages_raw(
             }
             if tool_calls:
                 message["tool_calls"] = tool_calls
+            _normalize_compat_tool_calls(message)
 
             data = {"object": "chat.completion.chunk.stream", "chunks": chunks, "message": message}
         else:
@@ -597,6 +683,7 @@ def call_chat_model_with_messages_raw(
             if not choices:
                 raise LLMCallError("模型返回空结果")
             message = choices[0].get("message") or {}
+            _normalize_compat_tool_calls(message)
 
         # 提取文本和工具调用
         text = _coerce_message_text(message)

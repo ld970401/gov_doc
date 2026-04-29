@@ -101,12 +101,8 @@ class MainAgent:
             max_string_chars=settings.debug_log_max_string_chars,
         )
         try:
-            use_stream = on_planner_stream is not None
-
-            def _stream_cb(ev: dict[str, Any]) -> None:
-                if on_planner_stream:
-                    on_planner_stream(ev)
-
+            # Planner 固定非流式：部分私有化网关对 stream=true + tools 仅返回空 delta，导致误判为空响应。
+            # Skill 执行仍由各 skill LLM（call_chat_model 等）按需 stream:true，不受影响。
             def _call_planner(*, strip_hint: bool = False, tool_choice: str = "auto") -> dict[str, Any]:
                 """实际发起 planner 请求。
 
@@ -126,8 +122,8 @@ class MainAgent:
                             "tools": [tool_schema],
                             "tool_choice": tool_choice,
                         },
-                        stream=use_stream,
-                        on_stream_event=_stream_cb if use_stream else None,
+                        stream=False,
+                        on_stream_event=None,
                     )
                 _prev = settings.llm_disable_thinking
                 _prev_kwargs = settings.llm_send_chat_template_kwargs
@@ -143,8 +139,8 @@ class MainAgent:
                             "tools": [tool_schema],
                             "tool_choice": tool_choice,
                         },
-                        stream=use_stream,
-                        on_stream_event=_stream_cb if use_stream else None,
+                        stream=False,
+                        on_stream_event=None,
                     )
                 finally:
                     settings.llm_disable_thinking = _prev
