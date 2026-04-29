@@ -2588,8 +2588,8 @@ def run_conversation(
             done_display = display_text_for_step(step, phase="done")
             tool_name = "main_agent" if is_main_agent_step else step.skill_name
 
-            compact_stream = step.skill_name in {"retrieval"}
-            text_only_stream = step.skill_name in {"writing","general"}
+            compact_stream = step.skill_name in {"retrieval","general"}
+            text_only_stream = step.skill_name in {"writing"}
             # 检索步骤采用紧凑事件：仅保留 tool_use start/stop，不再推送 input_json_delta 与 running。
             # 写作步骤仅保留 text start/delta/stop 一套事件，避免与 tool_use 形成双轨重复。
             if compact_stream:
