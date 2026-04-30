@@ -459,9 +459,7 @@ def _execute_skill_once(
                 max_string_chars=settings.debug_log_max_string_chars,
             )
 
-        # Legacy 返回 200 但 data/rows/list 为空时，若直接结束会导致 items 与 summary_text 皆空，
-        # runtime 会触发「检索没有拿到有效结果」的 waiting_user，后续 writing 步骤永远不会执行。
-        # 与接口失败同等处理：走 LLM 兜底，至少产出 summary_text 供 handoff 与写作使用。
+        # Legacy 返回 200 但 data/rows/list 为空时，不再走 LLM 兜底，直接返回空检索结果。
         if legacy.ok and legacy_items:
             normalized_items = _normalize_retrieval_items(legacy_items)
             normalized = {"items": normalized_items, "source": _normalized_source("legacy_success")}
@@ -494,17 +492,26 @@ def _execute_skill_once(
             return result
 
         if legacy.ok and not legacy_items:
-            log_stage(
-                "skill.retrieval.legacy_empty_fallback_llm",
+            empty_result = SkillExecutionResult(
                 {
-                    "path": "/report-agent/v1/document-material-retrieval",
-                    "legacyUrl": legacy.url,
-                    "reason": "legacy_http_ok_but_no_items",
+                    "items": [],
+                    "itemsTotal": 0,
+                    "source": _normalized_source("model_success"),
                 },
+                [],
+                [],
+                [],
+                True,
+                source_state="model_success",
+            )
+            log_stage(
+                "skill.execute.result",
+                {"skill": skill_name, "result": empty_result},
                 enabled=settings.debug_runtime_logs,
                 max_chars=settings.debug_log_max_chars,
                 max_string_chars=settings.debug_log_max_string_chars,
             )
+            return empty_result
 
         text, fallback_state, fallback_error, reasoning_content = _invoke_llm(
             prompt,
@@ -515,10 +522,12 @@ def _execute_skill_once(
             task_packet,
             on_text_delta=on_text_delta,
         )
-        items = [
-            {"title": "检索摘要", "description": line}
-            for line in [part.strip("- ").strip() for part in text.splitlines() if part.strip()][:5]
-        ]
+        full_summary = (text or "").strip()
+        items = (
+            [{"title": "检索摘要", "description": full_summary}]
+            if full_summary
+            else []
+        )
         log_stage(
             "skill.retrieval.fallback_items",
             {

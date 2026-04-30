@@ -1209,23 +1209,13 @@ def _build_prompt_menu(
         return skill_result.prompt_menu
 
     # 阶段 4：显式触发 waiting_user
-    # - retrieval 在 items 与 summary_text 均为空时，邀请用户补充检索方向
+    # - retrieval 在 items 与 summary_text 均为空时：不再打断流程，直接继续后续步骤
     # - writing 在 document 明显过短（<40 字）时，邀请用户补充背景或重试
     if step.skill_name == "retrieval":
         items = normalized_result.get("items") or []
         summary_text = (normalized_result.get("summary_text") or "").strip()
         if not items and not summary_text:
-            return {
-                "type": "clarification",
-                "title": "检索没有拿到有效结果",
-                "description": "请补充检索方向、资料范围或关键字，或直接告诉我按当前信息继续写作。",
-                "question": "希望围绕哪些关键词或政策文件继续检索？",
-                "options": [
-                    {"key": "custom_input", "label": "补充检索方向", "recommended": True},
-                ],
-                "resultPreview": normalized_result,
-                "resumeMode": "rerun_current_step",
-            }
+            return {}
     if step.skill_name == "writing":
         document = (normalized_result.get("document") or "").strip()
         if document and len(document) < 40 and skill_result.source_state != "model_error":
@@ -2320,18 +2310,14 @@ def run_conversation(
             and (pending_state.get("sourceState") == "model_error")
         )
         if pending_state and not model_error_pending:
+            prompt_menu = pending_state.get("promptMenu") if isinstance(pending_state, dict) else None
             push_event(
                 RuntimeTaskEvent(
                     type="waiting_user",
                     payload={
                         "taskId": pending_state.get("taskId"),
-                        "parentTaskId": pending_state.get("parentTaskId"),
-                        "promptMenu": pending_state["promptMenu"],
                         "resumeToken": pending_state["resumeToken"],
-                        "sourceState": pending_state.get("sourceState"),
-                        "errorDetail": pending_state.get("errorDetail"),
-                        "assistantMessageId": assistant_message.id,
-                        "artifactIds": [item.id for item in artifacts],
+                        "promptMenu": prompt_menu,
                     },
                 )
             )
