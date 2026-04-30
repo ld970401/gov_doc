@@ -246,6 +246,8 @@ class TestWritingDetectionAndNormalization(unittest.TestCase):
             "帮我生成一篇工作汇报",
             "起草倡议书",
             "写个实施方案",
+            "帮我准备一篇关于题目工作报告的正式文稿",
+            "我准备一份工作总结，数据和案例要写实",
         ]
         for text in samples:
             with self.subTest(text=text):
@@ -262,6 +264,16 @@ class TestWritingDetectionAndNormalization(unittest.TestCase):
         )
         self.assertEqual([s.skill_name for s in normalized], ["retrieval", "writing"])
         self.assertEqual(normalized[-1].depends_on, ["step_01_retrieval"])
+        self.assertIsNotNone(meta)
+
+    def test_normalize_appends_writing_when_user_says_prepare_not_write(self) -> None:
+        """模型只下发 retrieval 时，用户用「准备一篇…报告/正式文稿」也应触发补全 writing。"""
+        retrieval_step = _make_step(1, "retrieval", "资料检索")
+        normalized, meta = self.agent._normalize_document_steps(
+            "帮我准备一篇关于大数据局工作报告的正式文稿",
+            [retrieval_step],
+        )
+        self.assertEqual([s.skill_name for s in normalized], ["retrieval", "writing"])
         self.assertIsNotNone(meta)
 
     def test_normalize_noop_when_writing_already_present(self) -> None:

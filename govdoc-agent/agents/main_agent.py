@@ -512,6 +512,11 @@ class MainAgent:
             "生草",
             "起稿",
             "形成文稿",
+            # 口语里常说「准备一篇/一份…」而不出现「写」字，易被误判为非写作请求，
+            # 导致仅 retrieval 的步骤计划不会自动补上 writing。
+            "准备一篇",
+            "准备一份",
+            "正式文稿",
         )
         doc_markers = (
             "报告",
@@ -538,7 +543,15 @@ class MainAgent:
             "工作部署",
             "实施方案",
         )
-        return any(marker in text for marker in strong_markers) or (
+        if any(marker in text for marker in strong_markers):
+            return True
+        if (
+            ("准备" in text or "整一篇" in text or "弄一篇" in text)
+            and ("篇" in text or "份" in text)
+            and any(marker in text for marker in doc_markers)
+        ):
+            return True
+        return bool(
             any(marker in text for marker in ("写", "起草", "撰写", "生成", "拟"))
             and any(marker in text for marker in doc_markers)
         )

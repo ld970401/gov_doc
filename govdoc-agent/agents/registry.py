@@ -160,7 +160,12 @@ def selectable_sub_agents() -> list[AgentDefinition]:
 
 
 def exposed_agent_descriptors() -> list[dict]:
-    ordered = sorted(selectable_sub_agents(), key=lambda item: item.name)
+    order = ["retrieval", "writing", "review", "dedup", "layout"]
+    order_index = {k: i for i, k in enumerate(order)}
+    ordered = sorted(
+        selectable_sub_agents(),
+        key=lambda item: (order_index.get(item.name, 999), item.name),
+    )
     return [
         {
             "key": agent.name,

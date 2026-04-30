@@ -4,12 +4,14 @@
 - 前缀：/api/agentloop/conversations
 - POST /run：自动创建会话并运行（推荐新入口）
 - POST /{id}/run：运行已有会话（保留旧入口）
+- GET /{id}：会话最小视图；用户 messages[].content 为 {"text"}；助手为分字段 JSON（去除冗余字段，便于前端取值）
 - GET /{id}/events：text/event-stream，按 seq_no 递增推送 V4TaskEvent，结束发送 data: [DONE]
 """
 
 import json
 import time
 from datetime import datetime
+from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -21,6 +23,8 @@ from ..db import SessionLocal, get_db
 from ..debug_log import mask_cookie
 from ..models import (
     V4Conversation,
+    V4ConversationArtifact,
+    V4ConversationMessage,
     V4ConversationRun,
     V4TaskEvent,
 )
@@ -51,6 +55,49 @@ def _conversation_or_404(db: Session, conversation_id: str, user_id: str) -> V4C
     return conversation
 
 
+def _json_loads_safe(raw: str | None, default: Any) -> Any:
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return default
+
+
+def _conversation_detail_message_content(item: V4ConversationMessage) -> dict[str, Any]:
+    """会话详情中单条消息的 content：用户为 text；助手为可结构化消费的分字段内容。"""
+    if item.role == "user":
+        return {"text": (item.content or "").strip()}
+
+    meta = _json_loads_safe(item.meta_json, {})
+    leader = meta.get("leaderPlan") if isinstance(meta.get("leaderPlan"), dict) else {}
+
+    steps: list[dict[str, Any]] = []
+    raw_steps = meta.get("stepOutcomes")
+    if isinstance(raw_steps, list):
+        for raw in raw_steps:
+            if not isinstance(raw, dict):
+                continue
+            steps.append(
+                {
+                    "index": raw.get("index"),
+                    "taskId": raw.get("task_id"),
+                    "skillName": raw.get("skill_name"),
+                    "title": raw.get("title"),
+                    "normalizedResult": raw.get("normalized_result"),
+                    "sourceState": raw.get("source_state"),
+                    "errorDetail": raw.get("error_detail"),
+                }
+            )
+
+    return {
+        "model": item.model_name,
+        "planIntent": leader.get("intent"),
+        "planSummary": leader.get("summary"),
+        "steps": steps,
+    }
+
+
 @router.get("", response_model=AgentLoopResponse)
 def list_conversations(current_user=Depends(get_current_user), db: Session = Depends(get_db)):
     items = db.execute(
@@ -72,6 +119,57 @@ def list_conversations(current_user=Depends(get_current_user), db: Session = Dep
             }
             for item in items
         ]
+    )
+
+
+@router.get("/{conversation_id}", response_model=AgentLoopResponse)
+def get_conversation_detail(
+    conversation_id: str,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    conversation = _conversation_or_404(db, conversation_id, current_user.user_id)
+    messages = db.execute(
+        select(V4ConversationMessage)
+        .where(
+            V4ConversationMessage.conversation_id == conversation.id,
+            V4ConversationMessage.user_id == current_user.user_id,
+        )
+        .order_by(V4ConversationMessage.created_at.asc())
+    ).scalars().all()
+    artifacts = db.execute(
+        select(V4ConversationArtifact)
+        .where(
+            V4ConversationArtifact.conversation_id == conversation.id,
+            V4ConversationArtifact.user_id == current_user.user_id,
+        )
+        .order_by(V4ConversationArtifact.created_at.asc())
+    ).scalars().all()
+
+    return AgentLoopResponse(
+        data={
+            "id": conversation.id,
+            "title": conversation.title,
+            "messages": [
+                {
+                    "id": item.id,
+                    "role": item.role,
+                    "content": _conversation_detail_message_content(item),
+                    "createdAt": item.created_at.isoformat(),
+                }
+                for item in messages
+            ],
+            "artifacts": [
+                {
+                    "id": item.id,
+                    "title": item.title,
+                    "artifactType": item.artifact_type,
+                    "summary": item.summary,
+                    "workspaceNodeId": item.workspace_node_id,
+                }
+                for item in artifacts
+            ],
+        }
     )
 
 
