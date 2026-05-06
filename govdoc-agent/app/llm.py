@@ -10,6 +10,7 @@ LLM 模型调用封装模块。
 """
 
 import json  # 用于处理 JSON 数据
+import re
 from html import escape  # 用于 HTML 转义，防止 XSS 攻击
 from typing import Any, Callable  # 类型注解，提高代码可读性
 
@@ -50,6 +51,162 @@ def _timeout_for_purpose(purpose: str, stream: bool) -> float:
 class LLMCallError(RuntimeError):
     """LLM 调用异常类，用于表示模型调用过程中的错误。"""
     pass
+
+
+# 私有化网关有时把函数调用塞进 message.content：<tool_call>{"name":...}</tool_call>
+# 且不填充标准 message.tool_calls，这里在非流式/流式汇总后做一次兼容回填。
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>", re.IGNORECASE)
+
+
+def _extract_tool_calls_from_text(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """从 content 中解析 <tool_call> JSON；返回剔除块后的正文与合成的 tool_calls。"""
+    if not isinstance(text, str) or "<tool_call" not in text.lower():
+        return text, []
+
+    parsed_calls: list[dict[str, Any]] = []
+    for index, match in enumerate(_TOOL_CALL_BLOCK_RE.finditer(text), start=1):
+        raw_json = (match.group(1) or "").strip()
+        if not raw_json:
+            continue
+        try:
+            payload = json.loads(raw_json)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            continue
+        arguments = payload.get("arguments")
+        if isinstance(arguments, str):
+            arguments_text = arguments
+        elif isinstance(arguments, dict):
+            arguments_text = json.dumps(arguments, ensure_ascii=False)
+        else:
+            arguments_text = "{}"
+
+        parsed_calls.append(
+            {
+                "id": f"compat_tool_call_{index}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments_text,
+                },
+            }
+        )
+
+    cleaned_text = _TOOL_CALL_BLOCK_RE.sub("", text).strip()
+    return cleaned_text, parsed_calls
+
+
+def _normalize_compat_tool_calls(message: dict[str, Any]) -> None:
+    """将 legacy function_call / <tool_call> 文本回填为 OpenAI-style tool_calls（原地修改 message）。"""
+    existing = message.get("tool_calls") or []
+    if isinstance(existing, list) and existing:
+        return
+
+    function_call = message.get("function_call") or {}
+    if isinstance(function_call, dict):
+        fname = str(function_call.get("name") or "").strip()
+        if fname:
+            fargs = function_call.get("arguments")
+            if isinstance(fargs, str):
+                arguments_text = fargs
+            elif isinstance(fargs, dict):
+                arguments_text = json.dumps(fargs, ensure_ascii=False)
+            else:
+                arguments_text = "{}"
+            message["tool_calls"] = [
+                {
+                    "id": "compat_function_call_1",
+                    "type": "function",
+                    "function": {
+                        "name": fname,
+                        "arguments": arguments_text,
+                    },
+                }
+            ]
+            return
+
+    content = message.get("content")
+    if isinstance(content, str) and "<tool_call" in content.lower():
+        cleaned, calls = _extract_tool_calls_from_text(content)
+        if calls:
+            message["content"] = cleaned
+            message["tool_calls"] = calls
+
+
+def _is_qwen_family(model_name: str | None) -> bool:
+    """判断模型是否属于 Qwen 家族（Qwen3 / Qwen3.5 / qwen... 等）。
+
+    仅对 Qwen 系启用关闭 thinking 的 hint，避免给 MiniMax 等不识别该约定的模型
+    注入无意义字段（虽然绝大多数网关会忽略未知字段，但仍尽量保守）。
+    """
+    lower = (model_name or "").lower()
+    return lower.startswith("qwen")
+
+
+def _apply_disable_thinking(
+    payload: dict[str, Any],
+    model_name: str,
+    messages: list[dict[str, Any]],
+    *,
+    include_kwargs: bool | None = None,
+) -> list[dict[str, Any]]:
+    """为 Qwen 系模型注入关闭 thinking 的请求参数。
+
+    默认只做一件事（最稳妥）：
+    - 在最后一条 user / system 消息尾部追加 ``/no_think``。
+      Qwen3 chat template 在内部匹配该 token 并跳过 <think> 段；
+      对不识别该约定的模型也是无害文本，不会触发网关参数校验错误。
+
+    仅当 ``include_kwargs=True`` 或 settings.llm_send_chat_template_kwargs 显式开启时，
+    额外在顶层注入 ``chat_template_kwargs = {"enable_thinking": false}``。该字段仅
+    部分网关（官方 vLLM / SGLang 较新版本）识别；老旧私有化部署会以 400 拒绝，
+    导致 planner LLMCallError 回退成 general，这是上一版出现的故障根因。
+
+    返回用于实际发送的 messages（深拷贝，不污染调用方对象）。
+    调用方已显式传入 chat_template_kwargs 时不再覆盖。
+    """
+    if not settings.llm_disable_thinking or not _is_qwen_family(model_name):
+        return messages
+
+    # 是否携带额外的 chat_template_kwargs —— 默认关闭以保证兼容性
+    should_send_kwargs = (
+        include_kwargs if include_kwargs is not None else settings.llm_send_chat_template_kwargs
+    )
+    if should_send_kwargs:
+        payload.setdefault("chat_template_kwargs", {"enable_thinking": False})
+
+    # 深拷贝 messages，避免修改调用方持有的对象。
+    send_messages: list[dict[str, Any]] = [dict(m) for m in messages]
+    no_think_tag = "/no_think"
+    for item in reversed(send_messages):
+        role = item.get("role")
+        if role not in ("user", "system"):
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            if no_think_tag in content:
+                break
+            sep = "" if content.endswith(("\n", " ")) else "\n"
+            item["content"] = f"{content}{sep}{no_think_tag}"
+            break
+        if isinstance(content, list):
+            # OpenAI multimodal 消息格式：content 为部件数组
+            already = any(
+                isinstance(part, dict)
+                and part.get("type") in {"text", "output_text"}
+                and no_think_tag in (part.get("text") or "")
+                for part in content
+            )
+            if already:
+                break
+            content.append({"type": "text", "text": no_think_tag})
+            item["content"] = content
+            break
+    return send_messages
 
 
 # 辅助函数：获取完整的 chat/completions API URL
@@ -236,6 +393,35 @@ def _coerce_delta_text(value: Any) -> str:
     return ""
 
 
+def _coerce_choice_text(choice: dict[str, Any]) -> str:
+    """从单个 choice 中尽可能提取文本，兼容非标准网关字段。"""
+    if not isinstance(choice, dict):
+        return ""
+    message = choice.get("message")
+    if isinstance(message, dict):
+        msg_text = _coerce_message_text(message)
+        if msg_text:
+            return msg_text
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        delta_text = _coerce_delta_text(
+            delta.get("content")
+            or delta.get("text")
+            or delta.get("output_text")
+        )
+        if delta_text:
+            return delta_text
+    for key in ("text", "output_text", "content"):
+        raw = choice.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw
+        if isinstance(raw, list):
+            list_text = _coerce_delta_text(raw)
+            if list_text:
+                return list_text
+    return ""
+
+
 # 辅助函数：合并工具调用块
 def _merge_tool_call_chunks(existing: list[dict], delta_calls: list[dict]) -> list[dict]:
     """合并工具调用块，处理流式响应中的工具调用信息。"""
@@ -400,9 +586,13 @@ def call_chat_model_with_messages_raw(
                 if not choices:
                     continue
 
-                first_choice = choices[0] if isinstance(choices[0], dict) else {}
-                delta = first_choice.get("delta") or {}
+                choice0 = choices[0] if isinstance(choices[0], dict) else {}
+                delta = choice0.get("delta") or {}
                 delta_text = _coerce_delta_text(delta.get("content"))
+                if not delta_text:
+                    delta_text = _coerce_delta_text(delta.get("text") or delta.get("output_text"))
+                if not delta_text:
+                    delta_text = _coerce_choice_text(choice0)
                 delta_reasoning = _coerce_delta_text(
                     delta.get("reasoning_content") or delta.get("reasoning") or delta.get("reasoningContent")
                 )
@@ -448,8 +638,9 @@ def call_chat_model_with_messages_raw(
                                 "index": 1,
                                 "content_block": {"type": "text"},
                             })
+                    # 无论是否向上游透传流式事件，都必须累积正文；否则 compact 模式会被误判为空响应。
+                    text_parts.append(delta_text)
                     if on_stream_event:
-                        text_parts.append(delta_text)
                         on_stream_event({
                             "type": "content_block_delta",
                             "index": 1,
@@ -499,6 +690,19 @@ def call_chat_model_with_messages_raw(
             if not text and message_text_fallback:
                 text = message_text_fallback.strip()
             reasoning_content = "".join(reasoning_parts).strip()
+            # 某些兼容网关在 stream 模式不走标准 delta.content，而只在 choice.message/text 回传正文。
+            # 若增量拼接结果为空，回退到 chunks 中做一次聚合提取，避免误判为“模型返回内容为空”。
+            if not text:
+                fallback_parts: list[str] = []
+                for chunk in chunks:
+                    chunk_choices = chunk.get("choices") or []
+                    if not chunk_choices:
+                        continue
+                    piece = _coerce_choice_text(chunk_choices[0])
+                    if piece:
+                        fallback_parts.append(piece)
+                if fallback_parts:
+                    text = "".join(fallback_parts).strip()
             message = {
                 "role": "assistant",
                 "content": text,
@@ -506,6 +710,7 @@ def call_chat_model_with_messages_raw(
             }
             if tool_calls:
                 message["tool_calls"] = tool_calls
+            _normalize_compat_tool_calls(message)
 
             data = {"object": "chat.completion.chunk.stream", "chunks": chunks, "message": message}
         else:
@@ -515,6 +720,7 @@ def call_chat_model_with_messages_raw(
             if not choices:
                 raise LLMCallError("模型返回空结果")
             message = choices[0].get("message") or {}
+            _normalize_compat_tool_calls(message)
 
         # 提取文本和工具调用
         text = _coerce_message_text(message)

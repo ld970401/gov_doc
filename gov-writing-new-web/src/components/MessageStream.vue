@@ -36,6 +36,20 @@ const latestAssistantId = computed(() => {
   return last?.id || "";
 });
 
+/** 详情接口：用户/助手都支持 `{ text, ... }`；流式仍为字符串 */
+function plainMessageContent(message) {
+  const c = message?.content;
+  if (typeof c === "string") {
+    return c;
+  }
+  if (c && typeof c === "object") {
+    if (c.text != null) {
+      return String(c.text);
+    }
+  }
+  return "";
+}
+
 function stripHtml(html) {
   return String(html || "")
     .replace(/<br\s*\/?>/gi, "\n")
@@ -120,7 +134,7 @@ function renderPlannerHtml(text) {
 }
 
 async function copyMessage(message) {
-  const text = message.content || stripHtml(message.contentHtml || "");
+  const text = plainMessageContent(message) || stripHtml(message.contentHtml || "");
   try {
     await navigator.clipboard?.writeText(text);
     const next = new Set(copiedIds.value);
@@ -218,7 +232,7 @@ function hasReasoning(message) {
 }
 
 function messageHeadline(message) {
-  const content = (message?.content || "").trim();
+  const content = plainMessageContent(message).trim();
   if (content && !genericAssistantTitle(content) && content !== "执行中") {
     return content;
   }
@@ -247,7 +261,7 @@ function checkSuggestCli() {
   if (!last || last.id === lastSuggestEmitFor) {
     return;
   }
-  const blob = `${last.content || ""}${last.contentHtml || ""}`;
+  const blob = `${plainMessageContent(last) || ""}${last.contentHtml || ""}`;
   if (/(云盘|工作区|文件列表|有哪些文件)/.test(blob)) {
     lastSuggestEmitFor = last.id;
     emit("suggest-cli");
@@ -280,7 +294,7 @@ onMounted(() => {
           <span class="material-symbols-rounded">person</span>
           用户
         </div>
-        <p>{{ message.content }}</p>
+        <p>{{ plainMessageContent(message) }}</p>
       </div>
 
       <article v-else class="assistant-card">
@@ -327,7 +341,7 @@ onMounted(() => {
 
         <div
           class="assistant-body markdown-body"
-          v-html="renderMd(message.contentHtml, message.content)"
+          v-html="renderMd(message.contentHtml, plainMessageContent(message))"
         />
 
         <div

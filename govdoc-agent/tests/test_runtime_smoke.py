@@ -95,6 +95,27 @@ class TestEventPayloadSlimming(unittest.TestCase):
         self.assertEqual(slim["normalizedResult"]["itemsTotal"], 20)
         self.assertLessEqual(len(slim["normalizedResult"]["items"]), 5)
 
+    def test_content_block_stop_payload_slims_like_tool_result(self) -> None:
+        full_payload = {
+            "tool": "retrieval",
+            "taskId": "t1",
+            "skillName": "retrieval",
+            "stepIndex": 1,
+            "stepTitle": "资料检索",
+            "displayText": "检索完成",
+            "normalizedResult": {
+                "items": [{"title": f"item-{i}", "description": "y" * 500} for i in range(20)],
+                "source": "legacy_success",
+            },
+            "retryable": False,
+            "sourceState": "legacy_success",
+            "errorDetail": None,
+        }
+        slim = slim_payload("content_block_stop", full_payload)
+        self.assertEqual(slim["skillName"], "retrieval")
+        self.assertEqual(slim["normalizedResult"]["itemsTotal"], 20)
+        self.assertLessEqual(len(slim["normalizedResult"]["items"]), 5)
+
     def test_message_start_slim_picks_task_id_from_packet(self) -> None:
         payload = {"taskPacket": {"task_id": "abc", "skill_name": "writing"}}
         slim = slim_payload("message_start", payload)
@@ -226,6 +247,8 @@ class TestWritingDetectionAndNormalization(unittest.TestCase):
             "帮我生成一篇工作汇报",
             "起草倡议书",
             "写个实施方案",
+            "帮我准备一篇关于题目工作报告的正式文稿",
+            "我准备一份工作总结，数据和案例要写实",
         ]
         for text in samples:
             with self.subTest(text=text):
@@ -242,6 +265,16 @@ class TestWritingDetectionAndNormalization(unittest.TestCase):
         )
         self.assertEqual([s.skill_name for s in normalized], ["retrieval", "writing"])
         self.assertEqual(normalized[-1].depends_on, ["step_01_retrieval"])
+        self.assertIsNotNone(meta)
+
+    def test_normalize_appends_writing_when_user_says_prepare_not_write(self) -> None:
+        """模型只下发 retrieval 时，用户用「准备一篇…报告/正式文稿」也应触发补全 writing。"""
+        retrieval_step = _make_step(1, "retrieval", "资料检索")
+        normalized, meta = self.agent._normalize_document_steps(
+            "帮我准备一篇关于大数据局工作报告的正式文稿",
+            [retrieval_step],
+        )
+        self.assertEqual([s.skill_name for s in normalized], ["retrieval", "writing"])
         self.assertIsNotNone(meta)
 
     def test_normalize_noop_when_writing_already_present(self) -> None:

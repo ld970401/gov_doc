@@ -104,23 +104,89 @@ class MainAgent:
             max_string_chars=settings.debug_log_max_string_chars,
         )
         try:
-            use_stream = on_planner_stream is not None
+            # Planner 固定非流式：部分私有化网关对 stream=true + tools 仅返回空 delta，导致误判为空响应。
+            # Skill 执行仍由各 skill LLM（call_chat_model 等）按需 stream:true，不受影响。
+            def _call_planner(*, strip_hint: bool = False, tool_choice: str = "auto") -> dict[str, Any]:
+                """实际发起 planner 请求。
 
-            def _stream_cb(ev: dict[str, Any]) -> None:
-                if on_planner_stream:
-                    on_planner_stream(ev)
+                - ``strip_hint`` 为 True 时临时关闭 disable_thinking / chat_template_kwargs，
+                  规避部分网关对未知字段或 /no_think 附加文本不兼容而返回 400/422。
+                - ``tool_choice`` 通常为 ``auto``；对写作类意图可尝试 ``required`` 强制至少一次 tool call
+                  （网关不支持时由外层重试回退为 ``auto``）。
+                """
+                purpose = "planner.retry_no_think_hint" if strip_hint else "planner"
+                if not strip_hint:
+                    return call_chat_model_with_messages_raw(
+                        messages,
+                        settings.planner_model or requested_model,
+                        purpose=purpose,
+                        temperature=settings.planner_temperature,
+                        extra_payload={
+                            "tools": [tool_schema],
+                            "tool_choice": tool_choice,
+                        },
+                        stream=False,
+                        on_stream_event=None,
+                    )
+                _prev = settings.llm_disable_thinking
+                _prev_kwargs = settings.llm_send_chat_template_kwargs
+                try:
+                    settings.llm_disable_thinking = False
+                    settings.llm_send_chat_template_kwargs = False
+                    return call_chat_model_with_messages_raw(
+                        messages,
+                        settings.planner_model or requested_model,
+                        purpose=purpose,
+                        temperature=settings.planner_temperature,
+                        extra_payload={
+                            "tools": [tool_schema],
+                            "tool_choice": tool_choice,
+                        },
+                        stream=False,
+                        on_stream_event=None,
+                    )
+                finally:
+                    settings.llm_disable_thinking = _prev
+                    settings.llm_send_chat_template_kwargs = _prev_kwargs
 
-            def _call_planner() -> dict[str, Any]:
-                """实际发起 planner 请求（纯模型 JSON 规划，不传 tools）。"""
-                return call_chat_model_with_messages_raw(
-                    messages,
-                    settings.planner_model or requested_model,
-                    purpose="planner",
-                    temperature=settings.planner_temperature,
-                    stream=use_stream,
-                    on_stream_event=_stream_cb if use_stream else None,
-                )
-            response = _call_planner()
+            writing_intent = self._looks_like_writing_request(user_message)
+            preferred_tool_choice = (
+                "required"
+                if (settings.planner_force_tool_for_writing and writing_intent)
+                else "auto"
+            )
+            # 分步重试：写作意图优先 required；失败则 auto + 正常 hint；再失败则 auto + 去掉 hint。
+            trial_plan: list[tuple[str, bool, str]] = []
+            if preferred_tool_choice == "required":
+                trial_plan.append(("required", False, "planner.tool_choice.required"))
+            trial_plan.append(("auto", False, "planner.tool_choice.auto"))
+            trial_plan.append(("auto", True, "planner.strip_hint_then_auto"))
+
+            last_exc: LLMCallError | None = None
+            response: dict[str, Any] | None = None
+            for tc, strip_hint, strategy in trial_plan:
+                try:
+                    response = _call_planner(strip_hint=strip_hint, tool_choice=tc)
+                    last_exc = None
+                    break
+                except LLMCallError as exc:
+                    last_exc = exc
+                    log_stage(
+                        "planner.retry",
+                        {
+                            "reason": str(exc),
+                            "strategy": strategy,
+                            "toolChoice": tc,
+                            "stripHint": strip_hint,
+                        },
+                        enabled=settings.debug_runtime_logs,
+                        max_chars=settings.debug_log_max_chars,
+                        max_string_chars=settings.debug_log_max_string_chars,
+                    )
+            if response is None:
+                if last_exc is not None:
+                    raise last_exc
+                raise LLMCallError("planner: 无可用响应")
             message = response.get("message") or {}
             if on_planner_stream:
                 raw_content_flush = self._message_text(message)
@@ -593,6 +659,11 @@ class MainAgent:
             "生草",
             "起稿",
             "形成文稿",
+            # 口语里常说「准备一篇/一份…」而不出现「写」字，易被误判为非写作请求，
+            # 导致仅 retrieval 的步骤计划不会自动补上 writing。
+            "准备一篇",
+            "准备一份",
+            "正式文稿",
         )
         doc_markers = (
             "报告",
@@ -619,7 +690,15 @@ class MainAgent:
             "工作部署",
             "实施方案",
         )
-        return any(marker in text for marker in strong_markers) or (
+        if any(marker in text for marker in strong_markers):
+            return True
+        if (
+            ("准备" in text or "整一篇" in text or "弄一篇" in text)
+            and ("篇" in text or "份" in text)
+            and any(marker in text for marker in doc_markers)
+        ):
+            return True
+        return bool(
             any(marker in text for marker in ("写", "起草", "撰写", "生成", "拟"))
             and any(marker in text for marker in doc_markers)
         )

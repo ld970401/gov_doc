@@ -983,7 +983,9 @@ def _plan_payload(plan) -> dict:
         # displayTitle：前端"待办任务列表"卡片主文案（短语），
         # 例：「检索写作参考资料」「起草 五一放假通知」。
         base_title = (step.title or "").strip() or "待执行任务"
-        display_title = base_title
+        objective = (step.objective or "").strip()
+        # 优先展示和用户问题更贴近的 objective 片段，让计划卡片语义更直观。
+        display_title = objective[:60] if objective else base_title
         running_label = display_text_for_step(step, phase="running")
         done_label = display_text_for_step(step, phase="done")
         steps_payload.append(
@@ -991,7 +993,7 @@ def _plan_payload(plan) -> dict:
                 "index": step.index,
                 "skillName": step.skill_name,
                 "title": base_title,
-                "objective": step.objective,
+                "objective": objective,
                 "scope": step.scope,
                 "dependsOn": step.depends_on,
                 "subtaskRole": step.subtask_role,
@@ -1274,7 +1276,13 @@ def _build_prompt_menu(
         return skill_result.prompt_menu
 
     # 阶段 4：显式触发 waiting_user
+    # - retrieval 在 items 与 summary_text 均为空时：不再打断流程，直接继续后续步骤
     # - writing 在 document 明显过短（<40 字）时，邀请用户补充背景或重试
+    if step.skill_name == "retrieval":
+        items = normalized_result.get("items") or []
+        summary_text = (normalized_result.get("summary_text") or "").strip()
+        if not items and not summary_text:
+            return {}
     if step.skill_name == "writing":
         document = (normalized_result.get("document") or "").strip()
         if document and len(document) < 40 and skill_result.source_state != "model_error":
@@ -1565,9 +1573,9 @@ def _extract_synthetic_text(skill_name: str, skill_result: SkillExecutionResult)
             if not isinstance(item, dict):
                 continue
             title = (item.get("title") or item.get("name") or "资料").strip()
-            summary = (item.get("summary") or item.get("content") or "").strip()
-            if summary:
-                lines.append(f"- {title}: {summary}")
+            description = (item.get("description") or item.get("summary") or item.get("content") or "").strip()
+            if description:
+                lines.append(f"- {title}: {description}")
             else:
                 lines.append(f"- {title}")
         if lines:
@@ -2087,45 +2095,61 @@ def run_conversation(
         db.add(run)
     db.flush()
 
+    planning_tool_use_index = PLANNING_SUMMARY_TEXT_INDEX
+    planning_public_plan_payload = _plan_payload(plan)
+    planning_public_plan_payload.pop("requiresUserInput", None)
+    planning_public_plan_payload.pop("clarificationQuestion", None)
+    for step_item in planning_public_plan_payload.get("steps") or []:
+        if not isinstance(step_item, dict):
+            continue
+        step_item.pop("objective", None)
+        step_item.pop("actionLabel", None)
+        step_item.pop("pendingLabel", None)
+        step_item.pop("runningLabel", None)
+        step_item.pop("doneLabel", None)
+        step_item.pop("status", None)
+    planning_tool_result_payload = {
+        "tool": "a2a_planning",
+        "steps": len(plan.steps),
+        "taskPacket": packet.model_dump(),
+        "plan": planning_public_plan_payload,
+        "displayText": f"已规划 {len(plan.steps)} 个执行步骤",
+    }
+
     if planning_pre_events is not None:
         runtime_events = planning_pre_events
         saved_events_count = planning_saved_count
-        runtime_events.extend(
-            [
+        has_planning_thinking_start = any(
+            ev.type == "content_block_start" and ev.index == PLANNING_THINKING_INDEX
+            for ev in runtime_events
+        )
+        if has_planning_thinking_start:
+            runtime_events.append(
                 RuntimeTaskEvent(
                     type="content_block_stop",
                     index=PLANNING_THINKING_INDEX,
-                ),
-                RuntimeTaskEvent(
-                    type="content_block_start",
-                    index=PLANNING_SUMMARY_TEXT_INDEX,
-                    content_block={
-                        "type": "text",
-                        "purpose": "plan_summary",
-                        "displayText": "规划完成",
-                    },
-                ),
-                RuntimeTaskEvent(
-                    type="content_block_delta",
-                    index=PLANNING_SUMMARY_TEXT_INDEX,
-                    delta={"type": "text_delta", "text": "已完成执行计划生成与校验。"},
-                ),
-                RuntimeTaskEvent(
-                    type="content_block_stop",
-                    index=PLANNING_SUMMARY_TEXT_INDEX,
-                ),
-                RuntimeTaskEvent(
-                    type="tool_result",
-                    payload={
-                        "tool": "planner_plan",
-                        "steps": len(plan.steps),
-                        "taskPacket": packet.model_dump(),
-                        "plan": _plan_payload(plan),
-                        "plannerMeta": planner_meta,
-                        "displayText": f"已规划 {len(plan.steps)} 个执行步骤",
-                    },
-                ),
-            ]
+                )
+            )
+        runtime_events.append(
+            RuntimeTaskEvent(
+                type="content_block_start",
+                index=planning_tool_use_index,
+                content_block={
+                    "type": "tool_use",
+                    "name": "a2a_planning",
+                    "skillName": "a2a_planning",
+                    "stepIndex": 0,
+                    "stepTitle": "执行规划",
+                    "displayText": "进行中：执行规划",
+                },
+            )
+        )
+        runtime_events.append(
+            RuntimeTaskEvent(
+                type="content_block_stop",
+                index=planning_tool_use_index,
+                payload=planning_tool_result_payload,
+            )
         )
     else:
         runtime_events = [
@@ -2153,15 +2177,21 @@ def run_conversation(
                 index=PLANNING_THINKING_INDEX,
             ),
             RuntimeTaskEvent(
-                type="tool_result",
-                payload={
-                    "tool": "planner_plan",
-                    "steps": len(plan.steps),
-                    "taskPacket": packet.model_dump(),
-                    "plan": _plan_payload(plan),
-                    "plannerMeta": planner_meta,
-                    "displayText": f"已规划 {len(plan.steps)} 个执行步骤",
+                type="content_block_start",
+                index=planning_tool_use_index,
+                content_block={
+                    "type": "tool_use",
+                    "name": "a2a_planning",
+                    "skillName": "a2a_planning",
+                    "stepIndex": 0,
+                    "stepTitle": "执行规划",
+                    "displayText": "进行中：执行规划",
                 },
+            ),
+            RuntimeTaskEvent(
+                type="content_block_stop",
+                index=planning_tool_use_index,
+                payload=planning_tool_result_payload,
             ),
         ]
         saved_events_count = 0
@@ -2185,6 +2215,8 @@ def run_conversation(
         """
         text_index = text_index_for_step(step.index)
         purpose = purpose_for_skill(step.skill_name)
+        tool_name = "main_agent" if step.subtask_role == "main_agent" else step.skill_name
+        running_display = display_text_for_step(step, phase="running")
         state = {
             "started": False,
             "stopped": False,
@@ -2218,6 +2250,8 @@ def run_conversation(
                             content_block={
                                 "type": "text",
                                 "purpose": purpose,
+                                "name": tool_name,
+                                "displayText": running_display,
                                 "stepIndex": step.index,
                                 "stepTitle": step.title,
                                 "skillName": step.skill_name,
@@ -2234,13 +2268,15 @@ def run_conversation(
                 state["last_flush_len"] = n
                 state["last_flush_t"] = now
             if is_final and state["started"] and not state["stopped"]:
-                state["stopped"] = True
-                push(
-                    RuntimeTaskEvent(
-                        type="content_block_stop",
-                        index=text_index,
+                # writing 步骤的最终 stop 需携带完整 payload，统一在主流程拿到 skill_result 后再发送。
+                if step.skill_name != "writing":
+                    state["stopped"] = True
+                    push(
+                        RuntimeTaskEvent(
+                            type="content_block_stop",
+                            index=text_index,
+                        )
                     )
-                )
 
         def has_started() -> bool:
             return state["started"]
@@ -2339,36 +2375,27 @@ def run_conversation(
             requested_model,
         )
         db.commit()
-        if pending_state:
-            push_event(
-                RuntimeTaskEvent(
-                    type="message_delta",
-                    payload={"delta": {"stop_reason": "end_turn"}},
-                )
-            )
+        model_error_pending = (
+            isinstance(pending_state, dict)
+            and (pending_state.get("sourceState") == "model_error")
+        )
+        if pending_state and not model_error_pending:
+            prompt_menu = pending_state.get("promptMenu") if isinstance(pending_state, dict) else None
             push_event(
                 RuntimeTaskEvent(
                     type="waiting_user",
                     payload={
                         "taskId": pending_state.get("taskId"),
-                        "parentTaskId": pending_state.get("parentTaskId"),
-                        "promptMenu": pending_state["promptMenu"],
                         "resumeToken": pending_state["resumeToken"],
-                        "sourceState": pending_state.get("sourceState"),
-                        "errorDetail": pending_state.get("errorDetail"),
-                        "assistantMessageId": assistant_message.id,
-                        "artifactIds": [item.id for item in artifacts],
+                        "promptMenu": prompt_menu,
                     },
                 )
             )
             push_event(RuntimeTaskEvent(type="message_stop"))
+        elif model_error_pending:
+            # 模型失败场景直接结束流，不再额外下发 waiting_user / end_turn。
+            push_event(RuntimeTaskEvent(type="message_stop"))
         else:
-            push_event(
-                RuntimeTaskEvent(
-                    type="message_delta",
-                    payload={"delta": {"stop_reason": "end_turn"}},
-                )
-            )
             push_event(RuntimeTaskEvent(type="message_stop"))
         return {
             "run": run,
@@ -2443,12 +2470,6 @@ def run_conversation(
             },
         )
         db.commit()
-        push_event(
-            RuntimeTaskEvent(
-                type="message_delta",
-                payload={"delta": {"stop_reason": "end_turn"}},
-            )
-        )
         error_payload: dict[str, Any] = {
             "errorDetail": failure_text,
             "assistantMessageId": assistant_message.id,
@@ -2625,57 +2646,78 @@ def run_conversation(
             done_display = display_text_for_step(step, phase="done")
             tool_name = "main_agent" if is_main_agent_step else step.skill_name
 
-            safe_push(
-                RuntimeTaskEvent(
-                    type="content_block_start",
-                    index=tool_use_index,
-                    content_block={
-                        "type": "tool_use",
-                        "name": tool_name,
-                        "skillName": step.skill_name,
-                        "stepIndex": step.index,
-                        "stepTitle": step.title,
-                        "displayText": running_display,
-                    },
+            compact_stream = step.skill_name in {"retrieval","general"}
+            text_only_stream = step.skill_name in {"writing"}
+            # 检索步骤采用紧凑事件：仅保留 tool_use start/stop，不再推送 input_json_delta 与 running。
+            # 写作步骤仅保留 text start/delta/stop 一套事件，避免与 tool_use 形成双轨重复。
+            if compact_stream:
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="content_block_start",
+                        index=tool_use_index,
+                        content_block={
+                            "type": "tool_use",
+                            "name": tool_name,
+                            "skillName": step.skill_name,
+                            "stepIndex": step.index,
+                            "stepTitle": step.title,
+                            "displayText": running_display,
+                        },
+                    )
                 )
-            )
-            safe_push(
-                RuntimeTaskEvent(
-                    type="content_block_delta",
-                    index=tool_use_index,
-                    delta={
-                        "type": "input_json_delta",
-                        "partial_json": json.dumps({
-                            "subtask": subtask_id,
-                            "skill": step.skill_name,
-                            "depends_on": step.depends_on or [],
-                            "objective": step.objective,
-                        }, ensure_ascii=False),
-                    },
+            elif not text_only_stream:
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="content_block_start",
+                        index=tool_use_index,
+                        content_block={
+                            "type": "tool_use",
+                            "name": tool_name,
+                            "skillName": step.skill_name,
+                            "stepIndex": step.index,
+                            "stepTitle": step.title,
+                            "displayText": running_display,
+                        },
+                    )
                 )
-            )
-            safe_push(
-                RuntimeTaskEvent(
-                    type="content_block_stop",
-                    index=tool_use_index,
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="content_block_delta",
+                        index=tool_use_index,
+                        delta={
+                            "type": "input_json_delta",
+                            "partial_json": json.dumps({
+                                "subtask": subtask_id,
+                                "skill": step.skill_name,
+                                "depends_on": step.depends_on or [],
+                                "objective": step.objective,
+                            }, ensure_ascii=False),
+                        },
+                    )
                 )
-            )
-            safe_push(
-                RuntimeTaskEvent(
-                    type="running",
-                    payload={
-                        "taskId": subtask_id,
-                        "parentTaskId": task_id,
-                        "taskPacket": subtask_packet.model_dump(),
-                        "skillName": step.skill_name,
-                        "stepIndex": step.index,
-                        "stepTitle": step.title,
-                        "displayText": running_display,
-                    },
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="content_block_stop",
+                        index=tool_use_index,
+                    )
                 )
-            )
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="running",
+                        payload={
+                            "taskId": subtask_id,
+                            "parentTaskId": task_id,
+                            "taskPacket": subtask_packet.model_dump(),
+                            "skillName": step.skill_name,
+                            "stepIndex": step.index,
+                            "stepTitle": step.title,
+                            "displayText": running_display,
+                        },
+                    )
+                )
 
             step_stream_cb, stream_has_started = make_step_stream_callback(step, safe_push)
+            stream_callback = None if compact_stream else step_stream_cb
 
             if is_main_agent_step and pending_direct_answer:
                 skill_result = SkillExecutionResult(
@@ -2698,7 +2740,7 @@ def run_conversation(
                     runtime_context=runtime_context,
                     memory_context=memory_context,
                     task_packet=subtask_packet.model_dump(),
-                    on_text_delta=step_stream_cb,
+                    on_text_delta=stream_callback,
                 )
             else:
                 skill_result = agent_tool.call(
@@ -2710,12 +2752,13 @@ def run_conversation(
                     runtime_context=runtime_context,
                     memory_context=memory_context,
                     task_packet=subtask_packet.model_dump(),
-                    on_text_delta=step_stream_cb,
+                    on_text_delta=stream_callback,
                 )
 
             # 如果本步骤未走流式通道（例如 retrieval/writing 的 legacy JSON 成功），
             # 但仍有可展示的正文/摘要，则补发一次合成的 text 块，便于前端编辑器联动。
-            if not stream_has_started():
+            retrieval_summary_on_stop = False
+            if not compact_stream and not stream_has_started():
                 synthetic_text = _extract_synthetic_text(step.skill_name, skill_result)
                 if synthetic_text:
                     purpose = purpose_for_skill(step.skill_name)
@@ -2726,25 +2769,50 @@ def run_conversation(
                             content_block={
                                 "type": "text",
                                 "purpose": purpose,
+                                "name": tool_name,
+                                "displayText": running_display,
                                 "stepIndex": step.index,
                                 "stepTitle": step.title,
                                 "skillName": step.skill_name,
                             },
                         )
                     )
-                    safe_push(
-                        RuntimeTaskEvent(
-                            type="content_block_delta",
-                            index=text_index,
-                            delta={"type": "text_delta", "text": synthetic_text},
+                    # 检索 legacy：跳过大段 text_delta（与 normalizedResult 重复），在 stop 上挂结构化 payload 瘦身 SSE
+                    if step.skill_name == "retrieval":
+                        retrieval_summary_on_stop = True
+                        safe_push(
+                            RuntimeTaskEvent(
+                                type="content_block_stop",
+                                index=text_index,
+                                payload={
+                                    "tool": tool_name,
+                                    "taskId": subtask_id,
+                                    "skillName": step.skill_name,
+                                    "stepIndex": step.index,
+                                    "stepTitle": step.title,
+                                    "displayText": done_display,
+                                    "retryable": skill_result.retryable,
+                                    "sourceState": skill_result.source_state,
+                                    "errorDetail": skill_result.error_detail,
+                                    "normalizedResult": skill_result.normalized_result,
+                                },
+                            )
                         )
-                    )
-                    safe_push(
-                        RuntimeTaskEvent(
-                            type="content_block_stop",
-                            index=text_index,
+                    else:
+                        safe_push(
+                            RuntimeTaskEvent(
+                                type="content_block_delta",
+                                index=text_index,
+                                delta={"type": "text_delta", "text": synthetic_text},
+                            )
                         )
-                    )
+                        if step.skill_name != "writing":
+                            safe_push(
+                                RuntimeTaskEvent(
+                                    type="content_block_stop",
+                                    index=text_index,
+                                )
+                            )
 
             step_html = render_assistant_html(step.skill_name, skill_result, requested_model or "")
             step_summary = skill_result.render_blocks[0].get("title") if skill_result.render_blocks else title_for_skill(step.skill_name)
@@ -2754,23 +2822,49 @@ def run_conversation(
                 json.dumps(skill_result.normalized_result, ensure_ascii=False),
             )
             a2a_task_registry.set_status(subtask_id, TASK_STATUS_COMPLETED)
-            safe_push(
-                RuntimeTaskEvent(
-                    type="tool_result",
-                    payload={
-                        "tool": tool_name,
-                        "taskId": subtask_id,
-                        "skillName": step.skill_name,
-                        "stepIndex": step.index,
-                        "stepTitle": step.title,
-                        "displayText": done_display,
-                        "normalizedResult": skill_result.normalized_result,
-                        "retryable": skill_result.retryable,
-                        "sourceState": skill_result.source_state,
-                        "errorDetail": skill_result.error_detail,
-                    },
+            tool_result_payload: dict[str, Any] = {
+                "tool": tool_name,
+                "taskId": subtask_id,
+                "skillName": step.skill_name,
+                "stepIndex": step.index,
+                "stepTitle": step.title,
+                "displayText": done_display,
+                "normalizedResult": skill_result.normalized_result,
+                "retryable": skill_result.retryable,
+                "sourceState": skill_result.source_state,
+                "errorDetail": skill_result.error_detail,
+            }
+            if text_only_stream:
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="content_block_stop",
+                        index=text_index,
+                        payload=tool_result_payload,
+                    )
                 )
-            )
+            elif compact_stream:
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="content_block_stop",
+                        index=tool_use_index,
+                        payload=tool_result_payload,
+                    )
+                )
+            elif retrieval_summary_on_stop:
+                tool_result_payload.pop("normalizedResult", None)
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="tool_result",
+                        payload=tool_result_payload,
+                    )
+                )
+            else:
+                safe_push(
+                    RuntimeTaskEvent(
+                        type="tool_result",
+                        payload=tool_result_payload,
+                    )
+                )
             step_outcomes.append(
                 {
                     "index": step.index,

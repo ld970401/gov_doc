@@ -136,6 +136,7 @@ _FRONT_MATTER_HEADING_RE = re.compile(
     r"(?=\n\s*(?:##\s*)?正文\s*[:：]?\s*\n|$)",
     re.IGNORECASE,
 )
+_PLACEHOLDER_HINT_RE = re.compile(r"(?:待补充|待填写|自行填写|请补充|另行填写)")
 
 
 def extract_document_body(raw: str) -> str:
@@ -165,6 +166,8 @@ def clean_document_text(raw: str) -> str:
     body = strip_conversational_prefix(body)
     body = strip_markdown_to_plain(body)
     body = strip_trailing_offers(body)
+    # 统一未知信息占位符，避免出现多种"待补充/自行填写"写法。
+    body = _PLACEHOLDER_HINT_RE.sub("xxx", body)
     return body.strip()
 
 

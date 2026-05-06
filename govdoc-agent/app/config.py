@@ -25,6 +25,25 @@ def _load_dotenv() -> None:
         pass
 
 
+def _read_env_file_value(key: str) -> str:
+    """从项目根目录 .env 读取单个键值（进程环境缺失时兜底）。"""
+    env_path = _ROOT / ".env"
+    if not env_path.is_file():
+        return ""
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#") or "=" not in raw:
+                continue
+            k, v = raw.split("=", 1)
+            if k.strip() != key:
+                continue
+            return v.strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
+
+
 def _load_model_json() -> dict:
     """读取 config/model.json 中的 llm 段；文件缺失或解析失败时返回空 dict。"""
     if not _MODEL_JSON_PATH.is_file():  # 文件不存在时返回空字典
@@ -126,7 +145,7 @@ class Settings:
 
     # 数据库连接 URL，默认使用相对路径的 SQLite 数据库
     # 格式：sqlite:///数据库文件路径（相对于项目根目录）
-    database_url = os.getenv("NEW_APP_DATABASE_URL", "mysql+pymysql://root:123456@localhost:3366/govdoc_agent")
+    database_url = os.getenv("NEW_APP_DATABASE_URL", "mysql+pymysql://root:Rzvgz180$+@localhost:3306/govdoc_agent")
 
     # 旧系统鉴权服务的基础 URL（用于 Cookie 鉴权时回调验证）
     # 读取环境变量，不存在则为空字符串；末尾斜杠会被去除
@@ -135,6 +154,16 @@ class Settings:
     # 旧系统业务服务的基础 URL（用于调用旧系统 API）
     # 读取环境变量，不存在则为空字符串；末尾斜杠会被去除
     legacy_service_base_url = os.getenv("LEGACY_SERVICE_BASE_URL", "").rstrip("/")
+    # 旧系统固定 Cookie（可选）。当请求未携带 Cookie 时，用于本地联调兜底。
+    # 示例：SESSION=xxx; token=xxx; sso_token=xxx
+    # 兼容历史变量名 DEBUG_FORCE_LEGACY_COOKIE，优先使用 LEGACY_FIXED_COOKIE。
+    legacy_fixed_cookie = (
+        os.getenv("LEGACY_FIXED_COOKIE")
+        or _read_env_file_value("LEGACY_FIXED_COOKIE")
+        or os.getenv("DEBUG_FORCE_LEGACY_COOKIE")
+        or _read_env_file_value("DEBUG_FORCE_LEGACY_COOKIE")
+        or ""
+    ).strip()
 
     # 旧系统 HTTPS 证书校验策略：
     # - 默认 false：兼容内网自签名证书（避免 SSL CERTIFICATE_VERIFY_FAILED）

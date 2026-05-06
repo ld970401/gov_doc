@@ -84,13 +84,15 @@ def display_text_for_step(step: ExecutionStep, *, phase: str = "running") -> str
     skill = (step.skill_name or "").strip().lower()
     title = (step.title or "").strip()
     if phase == "done":
-        base = done_label_for_skill(skill)
-        if title and title not in base:
-            return f"{base} · {title}"
-        return base
+        if title:
+            return f"已完成：{title}"
+        return done_label_for_skill(skill)
     action = action_label_for_skill(skill)
-    target = title or "当前任务"
-    return f"正在{action} {target}".strip()
+    if title:
+        return f"进行中：{title}"
+    objective = (step.objective or "").strip()
+    target = (objective.splitlines()[0].strip()[:60] if objective else "") or "当前任务"
+    return f"正在{action}：{target}".strip()
 
 
 # --- 瘦身白名单 --------------------------------------------------------------
@@ -164,11 +166,8 @@ def _slim_normalized_result(skill_name: str | None, result: Any) -> Any:
             slim["itemsTotal"] = len(items)
         return slim
     if skill == "writing":
-        doc = result.get("document")
-        if isinstance(doc, str):
-            slim["documentPreview"] = doc[:400]
-            slim["documentLength"] = len(doc)
-        return slim
+        # 写作结果用于前端直接落稿，保留完整正文
+        return result
     if skill == "review":
         issues = result.get("issues") or []
         if isinstance(issues, list):
@@ -208,10 +207,10 @@ def _slim_normalized_result(skill_name: str | None, result: Any) -> Any:
 
 def _slim_retrieval_item(item: dict[str, Any]) -> dict[str, Any]:
     title = item.get("title") or item.get("name") or "资料"
-    summary = item.get("summary") or item.get("content") or ""
+    summary = item.get("description") or item.get("summary") or item.get("content") or ""
     if isinstance(summary, str) and len(summary) > 240:
         summary = summary[:240] + "…"
-    out: dict[str, Any] = {"title": title, "summary": summary}
+    out: dict[str, Any] = {"title": title, "description": summary}
     if item.get("source"):
         out["source"] = item["source"]
     if item.get("url"):
@@ -353,6 +352,8 @@ def slim_delta(event_type: str, delta: dict[str, Any] | None) -> dict[str, Any] 
 _PAYLOAD_SLIMMERS: dict[str, Any] = {
     "message_start": slim_message_start_payload,
     "tool_result": slim_tool_result_payload,
+    # 检索等 legacy 合成路径：正文在 content_block_stop.payload，与 tool_result 白名单一致以便落库瘦身
+    "content_block_stop": slim_tool_result_payload,
     "running": slim_running_payload,
     "waiting_user": slim_waiting_user_payload,
     "error": slim_error_payload,
