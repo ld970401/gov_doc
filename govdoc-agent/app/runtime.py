@@ -105,6 +105,36 @@ GENERIC_ASSISTANT_CONTENTS = {
 }  # 通用助手内容集合
 
 
+def _sanitize_text_for_db(value: str | None) -> str | None:
+    """清洗 DB 文本，避免 utf8mb3 库表因 4-byte 字符报 1366。"""
+    if value is None:
+        return None
+    # 去掉 NUL、UTF-16 surrogate、非 BMP 字符（常见为 emoji/异常码位），
+    # 避免 MySQL charset 不兼容导致 DataError 1366。
+    cleaned: list[str] = []
+    for ch in value:
+        code = ord(ch)
+        if code == 0:
+            continue
+        if 0xD800 <= code <= 0xDFFF:
+            continue
+        if code > 0xFFFF:
+            continue
+        cleaned.append(ch)
+    return "".join(cleaned)
+
+
+def _compact_html_for_db(html: str | None, max_chars: int = 4000) -> str:
+    """将 HTML 压缩为数据库预览版本，避免存储过大且不必要的渲染数据。"""
+    safe_html = _sanitize_text_for_db(html) or ""
+    if not safe_html:
+        return "<p></p>"
+    if len(safe_html) <= max_chars:
+        return safe_html
+    truncated = safe_html[:max_chars].rstrip()
+    return f"{truncated}<p>[内容已截断，完整内容请查看工作区文件]</p>"
+
+
 class TaskRegistry:
     """任务注册表，用于生成唯一的任务 ID。"""
     def __init__(self) -> None:
@@ -795,8 +825,8 @@ def _create_artifact_and_workspace_entry(
         node_id=node.id,
         version_no=1,
         title=artifact["title"],
-        content_text=artifact.get("summary"),
-        content_html=artifact.get("content_html"),
+        content_text=_sanitize_text_for_db(artifact.get("summary")),
+        content_html=_compact_html_for_db(artifact.get("content_html"), max_chars=6000),
         file_rel_path=version_path,
         annotations_json=_json(annotations),
     )
@@ -817,8 +847,8 @@ def _create_artifact_and_workspace_entry(
         user_id=current_user.user_id,
         artifact_type=artifact["artifact_type"],
         title=artifact["title"],
-        summary=artifact.get("summary"),
-        content_html=artifact.get("content_html"),
+        summary=_sanitize_text_for_db(artifact.get("summary")),
+        content_html=_compact_html_for_db(artifact.get("content_html"), max_chars=3000),
         workspace_node_id=node.id,
         meta_json=_json({"relativePath": version_path}),
     )
@@ -1033,11 +1063,30 @@ def _plan_from_payload(plan_payload: dict) -> ExecutionPlan:
 
 
 def _collect_task_tree(task_ids: list[str]) -> list[dict]:
+    def _slim_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+        """裁剪 task 快照，避免把大块消息/结果写入 conversation 运行态。"""
+        slim: dict[str, Any] = {
+            "taskId": snapshot.get("taskId") or snapshot.get("id"),
+            "parentTaskId": snapshot.get("parentTaskId"),
+            "status": snapshot.get("status"),
+            "title": _trim_prompt_text(str(snapshot.get("title") or ""), 120),
+            "skillName": snapshot.get("skillName"),
+            "teamId": snapshot.get("teamId"),
+        }
+        children = snapshot.get("children")
+        if isinstance(children, list) and children:
+            slim["children"] = [
+                {"taskId": item.get("taskId"), "status": item.get("status")}
+                for item in children
+                if isinstance(item, dict)
+            ][:20]
+        return slim
+
     snapshots: list[dict] = []
     for task_id in task_ids:
         snapshot = a2a_task_registry.get_snapshot(task_id)
         if snapshot:
-            snapshots.append(snapshot)
+            snapshots.append(_slim_snapshot(snapshot))
     return snapshots
 
 
@@ -1049,15 +1098,33 @@ def _read_runtime_state(conversation: V4Conversation) -> dict:
 
 
 def _merge_runtime_state(conversation: V4Conversation, runtime_context: dict, updates: dict) -> dict:
+    def _compact_recent_messages(messages: Any) -> list[dict]:
+        if not isinstance(messages, list):
+            return []
+        compacted: list[dict] = []
+        for item in messages[-8:]:
+            if not isinstance(item, dict):
+                continue
+            compacted.append(
+                {
+                    "role": item.get("role"),
+                    "content": _sanitize_text_for_db(_trim_prompt_text(str(item.get("content") or ""), 220)),
+                    "timestamp": item.get("timestamp"),
+                }
+            )
+        return compacted
+
     current = _read_runtime_state(conversation)
     merged = {
-        "summary": runtime_context.get("summary") or current.get("summary") or "",
-        "recentMessages": runtime_context.get("recent_messages") or current.get("recentMessages") or [],
+        "summary": _sanitize_text_for_db(runtime_context.get("summary") or current.get("summary") or "") or "",
+        "recentMessages": _compact_recent_messages(
+            runtime_context.get("recent_messages") or current.get("recentMessages") or []
+        ),
         "messageCount": runtime_context.get("message_count") or current.get("messageCount") or 0,
     }
     merged.update({key: value for key, value in current.items() if key not in merged})
     merged.update(updates)
-    conversation.running_context_json = _json(merged)
+    conversation.running_context_json = safe_text_column_json(merged)
     return merged
 
 
@@ -1207,23 +1274,7 @@ def _build_prompt_menu(
         return skill_result.prompt_menu
 
     # 阶段 4：显式触发 waiting_user
-    # - retrieval 在 items 与 summary_text 均为空时，邀请用户补充检索方向
     # - writing 在 document 明显过短（<40 字）时，邀请用户补充背景或重试
-    if step.skill_name == "retrieval":
-        items = normalized_result.get("items") or []
-        summary_text = (normalized_result.get("summary_text") or "").strip()
-        if not items and not summary_text:
-            return {
-                "type": "clarification",
-                "title": "检索没有拿到有效结果",
-                "description": "请补充检索方向、资料范围或关键字，或直接告诉我按当前信息继续写作。",
-                "question": "希望围绕哪些关键词或政策文件继续检索？",
-                "options": [
-                    {"key": "custom_input", "label": "补充检索方向", "recommended": True},
-                ],
-                "resultPreview": normalized_result,
-                "resumeMode": "rerun_current_step",
-            }
     if step.skill_name == "writing":
         document = (normalized_result.get("document") or "").strip()
         if document and len(document) < 40 and skill_result.source_state != "model_error":
@@ -1958,8 +2009,8 @@ def run_conversation(
         role="user",
         skill_name=primary_skill,
         model_name=requested_model,
-        content=content,
-        content_html=f"<p>{escape(content)}</p>",
+        content=_sanitize_text_for_db(content) or "",
+        content_html=_sanitize_text_for_db(f"<p>{escape(content)}</p>"),
         meta_json=safe_text_column_json(
             {
                 "attachments": attachments,
@@ -2066,7 +2117,7 @@ def run_conversation(
                 RuntimeTaskEvent(
                     type="tool_result",
                     payload={
-                        "tool": "a2a_planning",
+                        "tool": "planner_plan",
                         "steps": len(plan.steps),
                         "taskPacket": packet.model_dump(),
                         "plan": _plan_payload(plan),
@@ -2104,7 +2155,7 @@ def run_conversation(
             RuntimeTaskEvent(
                 type="tool_result",
                 payload={
-                    "tool": "a2a_planning",
+                    "tool": "planner_plan",
                     "steps": len(plan.steps),
                     "taskPacket": packet.model_dump(),
                     "plan": _plan_payload(plan),
@@ -2210,6 +2261,9 @@ def run_conversation(
             plan,
             step_outcomes,
         )
+        assistant_text = assistant_summary or ("等待你的下一步选择" if pending_state else "任务已完成")
+        # 会话消息只保留简版 HTML，完整结构化渲染信息走事件与工作区，不再把大段 HTML 塞进 DB。
+        assistant_html_for_db = _compact_html_for_db(text_to_html(assistant_text), max_chars=2500)
         merged_annotations = _merge_annotations(step_outcomes)
         assistant_message = V4ConversationMessage(
             conversation_id=conversation.id,
@@ -2218,8 +2272,8 @@ def run_conversation(
             role="assistant",
             skill_name=primary_skill,
             model_name=requested_model,
-            content=assistant_summary or ("等待你的下一步选择" if pending_state else "任务已完成"),
-            content_html=assistant_html,
+            content=_sanitize_text_for_db(assistant_text) or assistant_text,
+            content_html=assistant_html_for_db,
             annotations_json=_json(merged_annotations),
             meta_json=safe_text_column_json(
                 {
@@ -2350,7 +2404,9 @@ def run_conversation(
             skill_name=primary_skill,
             model_name=requested_model,
             content="执行失败",
-            content_html=f"<section class='assistant-block'><h4>执行失败</h4><p>{escape(failure_text)}</p></section>",
+            content_html=_sanitize_text_for_db(
+                f"<section class='assistant-block'><h4>执行失败</h4><p>{escape(failure_text)}</p></section>"
+            ),
             annotations_json=_json([]),
             meta_json=safe_text_column_json(
                 {

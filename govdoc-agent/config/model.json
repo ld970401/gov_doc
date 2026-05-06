@@ -22,9 +22,6 @@
     "enable_planner": true,
     "planner_model": "",
     "planner_temperature": 0.1,
-    "planner_max_steps": 5,
-    "planner_force_tool_for_writing": true,
-    "disable_thinking": true,
-    "send_chat_template_kwargs": false
+    "planner_max_steps": 5
   }
 }

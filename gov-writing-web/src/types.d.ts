@@ -1,5 +1,5 @@
 // 全局类型声明
-export {};
+export { };
 
 declare global {
   interface ChatSession {
@@ -19,10 +19,8 @@ declare global {
     createdAt: string;
     attachment?: unknown;
     skill?: string | null;
-    steps?: {
-      title: string;
-      steps: Step[];
-    };
+    /** assistant 的步骤流，按渲染顺序 append。 */
+    steps?: Step[];
     text?: string;
     textVisible?: boolean;
     streaming?: boolean;
@@ -43,18 +41,14 @@ declare global {
   }
 
   type StepType =
-    | 'think'
+    | 'common'
+    | 'text'
     | 'tool'
-    | 'claw'
-    | 'skill'
-    | 'cli'
     | 'template'
-    | 'subAgent'
     | 'document'
-    | 'documentOutput'
     | 'reportCard'
     | 'tableCard'
-    | 'plainText'
+    | 'text'
     | 'searchResult'
     | 'result';
 
@@ -69,7 +63,7 @@ declare global {
     | 'documentCard'
     | 'reportCard'
     | 'tableCard'
-    | 'plainText'
+    | 'text'
     | 'searchResult'
     | 'result';
 
@@ -77,11 +71,14 @@ declare global {
     id?: string;
     type: StepType;
     label?: string;
-    content?: unknown;
+    content?: any;
     contentType?: StepContentType;
     open?: boolean;
     timestamp?: number;
     streaming?: boolean;
+    status?: 'loading' | 'completed';
+    icon?: 'brain' | 'search' | 'pen';
+    clientStepId?: string;
     [key: string]: unknown;
   }
 

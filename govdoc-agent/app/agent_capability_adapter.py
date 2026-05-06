@@ -1,4 +1,5 @@
 import json
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -13,10 +14,19 @@ from agents import (
     get_agent_spec,
     prompt_key_for_agent,
 )
+from tools import WorkspaceArtifactTool
 from .config import settings
 from .debug_log import log_stage, mask_cookie
-from .llm import LLMCallError, call_chat_model, resolve_model_name, text_to_html
+from .llm import (
+    LLMCallError,
+    call_chat_model,
+    call_chat_model_with_messages_raw,
+    resolve_model_name,
+    text_to_html,
+)
 from .text_postprocess import clean_document_text, clean_general_text
+
+workspace_artifact_tool = WorkspaceArtifactTool()
 
 
 @dataclass
@@ -31,6 +41,8 @@ class SkillExecutionResult:
     prompt_menu: dict | None = None
     reasoning_content: str | None = None
 
+
+datasetIds = ["4998249e3c8611f19eeb0242ac1e0009","a71e0236396711f1b6430242ac1e0009","725584ce33cd11f19e3e0242ac1e0009","1e4e445c33cc11f18bd80242ac1e0009","7e09d28633cb11f191270242ac1e0009","5a2c34ae325d11f19d650242ac1e0009","54a41698275711f1be430242ac1e0009","8749b36a1c4811f18d390242ac1e0009","847cd73215d311f193ce0242ac1e0006","1add69d2058311f19aa20242ac1e0006","645a02fc058111f1a42a0242ac1e0006","a97a3a3c033d11f1ab430242ac1e0006","d2f2de82027011f195780242ac1e0006","4e8623b6026b11f1acb90242ac1e0006","4fdc5996026711f1b42b0242ac1e0006","53a8a7c4024311f1bf260242ac1e0006","70da2636023611f18fc60242ac1e0006","a2e3bf94019a11f1bc650242ac1e0006","11543622017111f1b1dd0242ac1e0006","ff9dcc7c017011f1ac310242ac1e0006","fac40854fffb11f0bb080242ac1e0006","a09fca24fcd711f0993f0242ac1e0006","0f28f1eaf69e11f0bab30242ac1e0016","d23c090ef02411f0aee40242ac1e000a","53010398ed2111f099c20242ac1e0006","98d6bf26ed0711f09cd30242ac1e0006","d7f60fc2db1411f082030242ac1e0006","927c1c90d3e211f08fdb0242ac1e0006","4c12b0fed3d111f0831f0242ac1e0006","eff0725ecf5f11f08f430242ac1e0006","1ad7361acf2e11f0ad780242ac1e0006","0ee2bb18cf2911f09c3a0242ac1e0006","9a719d18cf1d11f083820242ac1e0006","fe53700acb8411f0a9900242ac1d0006","78b72a9ccb6911f0b16d0242ac1d0006","4e5f6b5cc91511f09ca10242ac1d0006","5ee8f604c91111f09b6f0242ac1d0006","b8f36adcbee211f0b6cb0242ac1d0006","bd1267faba1711f09ae40242ac1d0006","639f802eb53311f0b16a0242ac1d0006","513cebdeaa6a11f089ef0242ac1d0006","6d364f8aaa6311f085170242ac1d0006","201ab25a94f511f0b2e60242ac180007","a101daaa8e2011f0be370242ac180007","1defb45e8d6f11f0a02f0242ac180007","91dc1952886a11f0b4ac0242ac180007","2422c0dc87d911f0be7e0242ac180007","31894b4487a511f0b48b0242ac180007","23daeffa857c11f083800242ac180007","876cee72857911f09afa0242ac180007","4d7764e684b011f0bd640242ac180007","ea9f35da84a811f08c570242ac180007","dbc97bba84a811f083940242ac180007","8252014c83e011f096df0242ac180007","3e10a91883d911f090240242ac180007","92a9a99c831c11f086f70242ac150007","81e2763a7e6111f090390242c0a84006","e8f438127e5d11f0adcd0242c0a84006"]
 
 @dataclass
 class LegacyCallResult:
@@ -219,6 +231,18 @@ def _invoke_llm(
     """始终调用远程 LLM（OpenAI 兼容接口）。失败返回 model_error 与错误信息，不再使用本地模板兜底。"""
     resolved_model = resolve_model_name(requested_model)
 
+    def _call_once(*, stream: bool) -> dict[str, Any]:
+        return call_chat_model(
+            prompt,
+            prompt_key_for_agent(skill_name),
+            requested_model,
+            runtime_context,
+            memory_context,
+            task_packet,
+            stream=stream,
+            on_stream_event=_stream_handler if (stream and on_text_delta) else None,
+        )
+
     def _stream_handler(ev: dict[str, Any]) -> None:
         if not on_text_delta:
             return
@@ -231,16 +255,7 @@ def _invoke_llm(
             _stream_handler._accumulated = ""
 
     try:
-        response = call_chat_model(
-            prompt,
-            prompt_key_for_agent(skill_name),
-            requested_model,
-            runtime_context,
-            memory_context,
-            task_packet,
-            stream=True,
-            on_stream_event=_stream_handler if on_text_delta else None,
-        )
+        response = _call_once(stream=True)
         text = response["text"]
         reasoning_content = (response.get("message") or {}).get("reasoning_content")
         log_stage(
@@ -262,6 +277,33 @@ def _invoke_llm(
         return text or "", "model_success", None, reasoning_content
     except LLMCallError as exc:
         err = str(exc)
+        # 兼容部分网关的流式实现差异：stream=true 时偶发无 content，
+        # 改用非流式再试一次，避免误判为 model_error。
+        if "模型返回内容为空" in err:
+            try:
+                retry_response = _call_once(stream=False)
+                retry_text = retry_response["text"]
+                retry_reasoning = (retry_response.get("message") or {}).get("reasoning_content")
+                log_stage(
+                    "skill.llm.remote_ok_non_stream_retry",
+                    {
+                        "skill": skill_name,
+                        "requestedModel": requested_model,
+                        "resolvedModel": resolved_model,
+                        "text": (retry_text or "")[:2000],
+                        "reasoningContent": retry_reasoning,
+                        "retryReason": err,
+                    },
+                    enabled=settings.debug_runtime_logs,
+                    max_chars=settings.debug_log_max_chars,
+                    max_string_chars=settings.debug_log_max_string_chars,
+                )
+                if on_text_delta:
+                    on_text_delta(retry_text or "", "")
+                return retry_text or "", "model_success", None, retry_reasoning
+            except LLMCallError:
+                # 非流式重试也失败，继续走下方统一错误处理。
+                pass
         log_stage(
             "skill.llm.remote_error",
             {
@@ -306,6 +348,120 @@ def _normalized_source(source_state: str) -> str:
     return source_state
 
 
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+_CJK_TOKEN_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]{2,}")
+
+
+def _sanitize_rewritten_query(text: str) -> str:
+    """清洗 query 改写结果，去掉思考标签/围栏/寒暄等噪声。"""
+    if not text:
+        return ""
+    cleaned = _THINK_BLOCK_RE.sub(" ", text)
+    cleaned = cleaned.replace("```", " ").replace("`", " ")
+    cleaned = cleaned.replace("\r", " ").replace("\n", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t-:;,.，。！？")
+    return cleaned.strip()
+
+
+def _fallback_query_from_prompt(prompt: str, max_len: int = 80) -> str:
+    """规则兜底：从原 prompt 提取核心短语，避免把完整任务描述直接喂给检索。"""
+    source = (prompt or "").strip()
+    if not source:
+        return ""
+    core = _sanitize_rewritten_query(source)
+    # 先按常见分隔切第一段，避免过长说明句。
+    first_chunk = re.split(r"[，。；;,.!?！？\n]", core, maxsplit=1)[0].strip()
+    candidate = first_chunk or core
+    tokens = _CJK_TOKEN_RE.findall(candidate)
+    if tokens:
+        candidate = " ".join(tokens[:8]).strip()
+    return candidate[:max_len].strip()
+
+
+def _is_rewrite_effective(original: str, rewritten: str) -> bool:
+    """判定改写是否有效：避免与原文几乎一致或过长复述。"""
+    o = _sanitize_rewritten_query(original).lower()
+    r = _sanitize_rewritten_query(rewritten).lower()
+    if not r or len(r) < 4:
+        return False
+    if o == r:
+        return False
+    # 原文较长时，若改写仅是前缀截断或基本复读，视为无效改写。
+    if len(o) >= 24 and (o.startswith(r) or r.startswith(o[: min(len(o), 18)])):
+        return False
+    return True
+
+
+def _rewrite_retrieval_query(prompt: str, requested_model: str | None) -> str:
+    """将检索任务描述转写为更适合 legacy 检索接口的短 query。
+
+    失败时回退到原始 prompt（截断），保证检索流程可继续。
+    """
+    fallback = _fallback_query_from_prompt(prompt, max_len=80) or (prompt or "").strip()[:180]
+    if not fallback:
+        return ""
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是检索查询改写器。"
+                "请把输入改写为一条简洁检索 query，保留核心实体、时间范围与文种。"
+                "仅输出 query 本身，不要解释，不要 markdown。"
+            ),
+        },
+        {"role": "user", "content": fallback},
+    ]
+    try:
+        response = call_chat_model_with_messages_raw(
+            messages,
+            requested_model,
+            purpose="retrieval.query_rewrite",
+            temperature=0.1,
+            extra_payload={"max_tokens": 80},
+            stream=False,
+        )
+        rewritten = _sanitize_rewritten_query((response.get("text") or "").strip())
+        first_line = (rewritten.splitlines()[0].strip() if rewritten else "")
+        invalid_markers = ("<think", "</think>", "好的", "当然", "我来", "改写如下")
+        lowered = first_line.lower()
+        is_invalid = (
+            (not first_line)
+            or any(marker in first_line for marker in invalid_markers)
+            or lowered.startswith(("好的", "当然", "改写"))
+            or len(first_line) < 4
+        )
+        if not is_invalid and _is_rewrite_effective(fallback, first_line):
+            return first_line[:80]
+
+        # 二次改写：当第一次改写无效或几乎未变化时，强约束生成“关键词短语”。
+        retry_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是检索词压缩器。"
+                    "将输入压缩为 8-24 字的检索关键词短语，必须包含主题实体和年份/时间。"
+                    "禁止解释、禁止寒暄、禁止输出 <think>，仅输出一行短语。"
+                ),
+            },
+            {"role": "user", "content": fallback},
+        ]
+        retry_response = call_chat_model_with_messages_raw(
+            retry_messages,
+            requested_model,
+            purpose="retrieval.query_rewrite.retry",
+            temperature=0.1,
+            extra_payload={"max_tokens": 40},
+            stream=False,
+        )
+        retry_rewritten = _sanitize_rewritten_query((retry_response.get("text") or "").strip())
+        retry_line = (retry_rewritten.splitlines()[0].strip() if retry_rewritten else "")
+        if retry_line and _is_rewrite_effective(fallback, retry_line):
+            return retry_line[:80]
+        return fallback
+    except LLMCallError:
+        return fallback
+
+
 def _execute_skill_once(
     skill_name: str,
     content: str,
@@ -341,11 +497,13 @@ def _execute_skill_once(
             runtime_context,
             memory_context,
             task_packet,
-            on_text_delta=on_text_delta,
+            on_text_delta=None,
         )
         # 通用回复：剥离"好的，我可以帮您…"等寒暄前缀与末尾客套，保留自然格式。
         if source_state == "model_success":
             text = clean_general_text(text)
+        if on_text_delta:
+            on_text_delta(text or "", "")
         result = SkillExecutionResult(
             {"text": text, "source": _normalized_source(source_state)},
             [{"type": "general", "title": "通用回答", "html": text_to_html(text)}],
@@ -366,89 +524,45 @@ def _execute_skill_once(
         return result
 
     if skill_name == "retrieval":
+        rewritten_query = _rewrite_retrieval_query(prompt, requested_model)
+        query_payload = {"query": rewritten_query, "title": "", "keywords": [], "datasetIds": datasetIds, "pageNo":1,"pageSize":50}
+        log_stage(
+            "skill.retrieval.query_rewrite",
+            {"originalPrompt": (prompt or "")[:500], "rewrittenQuery": rewritten_query},
+            enabled=settings.debug_runtime_logs,
+            max_chars=settings.debug_log_max_chars,
+            max_string_chars=settings.debug_log_max_string_chars,
+        )
         legacy = _try_legacy_json(
             "/report-agent/v1/document-material-retrieval",
-            {"query": prompt, "text": prompt, "keyword": prompt},
+            query_payload,
             cookies,
         )
-        legacy_items: list[Any] = []
+        items: list[Any] = []
         if legacy.ok:
             body = legacy.payload if isinstance(legacy.payload, dict) else {}
             raw_items = body.get("data") or body.get("rows") or body.get("list") or []
             if isinstance(raw_items, list):
-                legacy_items = raw_items
+                items = raw_items
             elif raw_items is not None:
-                legacy_items = [raw_items]
-
-        # Legacy 返回 200 但 data/rows/list 为空时，若直接结束会导致 items 与 summary_text 皆空，
-        # runtime 会触发「检索没有拿到有效结果」的 waiting_user，后续 writing 步骤永远不会执行。
-        # 与接口失败同等处理：走 LLM 兜底，至少产出 summary_text 供 handoff 与写作使用。
-        if legacy.ok and legacy_items:
-            normalized = {"items": legacy_items, "source": _normalized_source("legacy_success")}
-            render_blocks = [
-                {
-                    "type": "summary",
-                    "title": "检索结果",
-                    "html": text_to_html(json.dumps(legacy_items[:5], ensure_ascii=False)),
-                }
-            ]
-            result = SkillExecutionResult(
-                normalized,
-                render_blocks,
-                [],
-                [],
-                False,
-                source_state="legacy_success",
-            )
-            log_stage(
-                "skill.execute.result",
-                {"skill": skill_name, "result": result},
-                enabled=settings.debug_runtime_logs,
-                max_chars=settings.debug_log_max_chars,
-                max_string_chars=settings.debug_log_max_string_chars,
-            )
-            return result
-
-        if legacy.ok and not legacy_items:
-            log_stage(
-                "skill.retrieval.legacy_empty_fallback_llm",
-                {
-                    "path": "/report-agent/v1/document-material-retrieval",
-                    "legacyUrl": legacy.url,
-                    "reason": "legacy_http_ok_but_no_items",
-                },
-                enabled=settings.debug_runtime_logs,
-                max_chars=settings.debug_log_max_chars,
-                max_string_chars=settings.debug_log_max_string_chars,
-            )
-
-        text, fallback_state, fallback_error, reasoning_content = _invoke_llm(
-            prompt,
-            skill_name,
-            requested_model,
-            runtime_context,
-            memory_context,
-            task_packet,
-            on_text_delta=on_text_delta,
-        )
-        items = [
-            {"title": "检索摘要", "summary": line}
-            for line in [part.strip("- ").strip() for part in text.splitlines() if part.strip()][:5]
-        ]
-        # 同步保留整段 LLM 兜底输出，供 build_handoff_content 作为完整背景资料下传给 writing 步骤。
+                items = [raw_items]
+            source_state = "legacy_success"
+            error_detail = None
+        else:
+            source_state = "legacy_error"
+            error_detail = legacy.error
         result = SkillExecutionResult(
             {
                 "items": items,
-                "source": _normalized_source(fallback_state),
-                "summary_text": text,
+                "source": _normalized_source(source_state),
             },
-            [{"type": "summary", "title": "检索结果", "html": text_to_html(text)}],
+            [{"type": "summary", "title": "检索结果", "html": text_to_html(json.dumps(items[:5], ensure_ascii=False))}],
             [],
             [],
-            True,
-            source_state=fallback_state,
-            error_detail=legacy.error or fallback_error,
-            reasoning_content=reasoning_content,
+            False,
+            source_state=source_state,
+            error_detail=error_detail,
+            reasoning_content=None,
         )
         log_stage(
             "skill.execute.result",
@@ -478,14 +592,27 @@ def _execute_skill_once(
                 runtime_context,
                 memory_context,
                 task_packet,
-                on_text_delta=on_text_delta,
+                on_text_delta=None,
             )
         # 公文正文强制纯文本：抽取 <正文>...</正文>、剥离 Markdown、去除寒暄与末尾客套。
         # 即使模型违规输出 Markdown，前端最终看到的也是可直接粘贴到 Word 的纯文本。
         if source_state in ("model_success", "legacy_success") and text:
             text = clean_document_text(text)
+        if on_text_delta:
+            on_text_delta(text or "", "")
+        workspace_commit_stub = workspace_artifact_tool.call(
+            {
+                "title": "公文写作结果.docx",
+                "artifact_type": "document",
+                "content_text": text,
+            }
+        )
         result = SkillExecutionResult(
-            {"document": text, "source": _normalized_source(source_state)},
+            {
+                "document": text,
+                "source": _normalized_source(source_state),
+                "workspaceCommit": workspace_commit_stub,
+            },
             [{"type": "document", "title": "公文写作结果", "html": text_to_html(text)}],
             [
                 {

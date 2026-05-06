@@ -1,11 +1,6 @@
 <template>
   <div class="conversation-view" :class="{ visible: visible }">
-    <div
-      v-for="(message, index) in localMessages"
-      :key="message.id || `m-${index}`"
-      class="message"
-      :class="message.role === 'user' ? 'user-message' : 'assistant-message'"
-    >
+    <div v-for="(message, index) in messages" :key="message.id || `m-${index}`" class="message" :class="message.role === 'user' ? 'user-message' : 'assistant-message'">
       <div v-if="message.role === 'user'" class="user-message-content">
         <div v-if="message.attachment" class="user-attachment">
           <el-icon><Upload /></el-icon>
@@ -21,38 +16,20 @@
       </div>
 
       <div v-else class="assistant-message-content">
-        <div v-if="getStepTitle(message)" class="assistant-header">
-          <div class="assistant-meta">
-            <div class="assistant-caption">{{ getStepTitle(message) }}</div>
-          </div>
-          <div class="assistant-status" :class="{ streaming: isMessageStreaming(message) }">
-            <template v-if="isMessageStreaming(message)">
-              <span class="status-dot" aria-hidden="true"></span>
-              流式执行中
-            </template>
-            <template v-else>
-              <el-icon><CircleCheck /></el-icon>
-              执行完成
-            </template>
-          </div>
-        </div>
         <AgentSteps
-          v-if="getStepList(message).length"
+          v-if="getStepList(message).length || isMessageStreaming(message)"
           :steps="getStepList(message)"
           :animated="isMessageStreaming(message)"
-          @step-rendered="handleStepRendered"
-          @steps-complete="handleStepsComplete(message)"
+          :streaming="isMessageStreaming(message)"
+          @step-rendered="(payload) => handleStepRendered(message, payload)"
+          @steps-complete="(payload) => handleStepsComplete(message, payload)"
         />
 
-        <div
-          v-if="message.text"
-          class="assistant-text-bubble"
-          :class="{ 'stream-hidden': !message.textVisible, 'stream-visible': message.textVisible }"
-        >
+        <div v-if="message.text" class="assistant-text-bubble" :class="{ 'stream-hidden': !message.textVisible, 'stream-visible': message.textVisible }">
           <div v-html="message.text"></div>
         </div>
 
-        <div class="msg-actions">
+        <div v-if="!isMessageStreaming(message)" class="msg-actions">
           <button class="msg-action-btn" title="复制" @click="handleCopy(message)">
             <el-icon><CopyDocument /></el-icon>
           </button>
@@ -69,8 +46,8 @@
 </template>
 
 <script setup lang="ts">
-import { CircleCheck, CopyDocument, Refresh, Search, Star, Upload } from '@element-plus/icons-vue';
-import { ref, watch } from 'vue';
+import { CopyDocument, Refresh, Search, Star, Upload } from '@element-plus/icons-vue';
+import { computed } from 'vue';
 import AgentSteps from './AgentSteps.vue';
 
 const props = defineProps({
@@ -87,21 +64,10 @@ const props = defineProps({
 const emit = defineEmits<{
   copy: [message: ChatMessage];
   'thumb-up': [message: ChatMessage];
-  'thumb-down': [message: ChatMessage];
   refresh: [message: ChatMessage];
-  'step-rendered': [];
-  'steps-complete': [message: ChatMessage];
+  'step-rendered': [payload: { messageId: string; stepKey: string; phase: 'revealed' }];
+  'steps-complete': [payload: { messageId: string; phase: 'all_completed' }];
 }>();
-
-const localMessages = ref<ChatMessage[]>([]);
-
-watch(
-  () => props.messages,
-  (newMessages) => {
-    localMessages.value = newMessages;
-  },
-  { immediate: true, deep: true },
-);
 
 const handleCopy = (message: ChatMessage) => {
   emit('copy', message);
@@ -111,38 +77,32 @@ const handleThumbUp = (message: ChatMessage) => {
   emit('thumb-up', message);
 };
 
-const handleThumbDown = (message: ChatMessage) => {
-  emit('thumb-down', message);
-};
-
 const handleRefresh = (message: ChatMessage) => {
   emit('refresh', message);
 };
 
-const handleStepRendered = () => {
-  emit('step-rendered');
+const handleStepRendered = (message: ChatMessage, payload: { stepKey: string; phase: 'revealed' }) => {
+  emit('step-rendered', {
+    messageId: message.id,
+    stepKey: payload.stepKey,
+    phase: payload.phase,
+  });
 };
 
-const handleStepsComplete = (message: ChatMessage) => {
-  emit('steps-complete', message);
-};
-
-const getStepTitle = (message: ChatMessage) => {
-  const rawSteps = message.steps as { title?: string; steps?: Step[] } | undefined;
-  if (!rawSteps) return '';
-  if (Array.isArray(rawSteps)) return '';
-  return rawSteps.title || '';
+const handleStepsComplete = (message: ChatMessage, payload: { phase: 'all_completed' }) => {
+  emit('steps-complete', {
+    messageId: message.id,
+    phase: payload.phase,
+  });
 };
 
 const getStepList = (message: ChatMessage): Step[] => {
-  const rawSteps = message.steps as { steps?: Step[] } | Step[] | undefined;
-  if (!rawSteps) return [];
-  if (Array.isArray(rawSteps)) return rawSteps;
-  if (Array.isArray(rawSteps.steps)) return rawSteps.steps;
-  return [];
+  return message.steps || [];
 };
 
 const isMessageStreaming = (message: ChatMessage) => message.streaming === true;
+
+const messages = computed(() => props.messages);
 </script>
 
 <style scoped lang="scss">
@@ -241,59 +201,6 @@ const isMessageStreaming = (message: ChatMessage) => message.streaming === true;
   flex-direction: column;
   gap: 8px;
   width: 100%;
-
-  .assistant-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 14px;
-    margin-bottom: 14px;
-
-    .assistant-meta {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-
-      .assistant-caption {
-        font-size: 18px;
-        font-weight: 600;
-        line-height: 1.3;
-        color: #1f1f1f;
-      }
-    }
-
-    .assistant-status {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 13px;
-      color: #64748b;
-
-      &.streaming {
-        color: var(--primary);
-      }
-
-      .status-dot {
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        background: var(--primary);
-        animation: pulse 1.2s ease-in-out infinite;
-      }
-    }
-  }
-}
-
-@keyframes pulse {
-  0%,
-  100% {
-    opacity: 1;
-    transform: scale(1);
-  }
-  50% {
-    opacity: 0.45;
-    transform: scale(0.92);
-  }
 }
 
 .assistant-text-bubble {

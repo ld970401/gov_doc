@@ -11,7 +11,11 @@
         </el-icon>
         新对话
       </button>
-      <button class="btn-cloud-disk" @click="handleCloudDisk">
+      <button
+        class="btn-cloud-disk"
+        :class="{ active: isWorkspaceActive }"
+        @click="handleCloudDisk"
+      >
         <el-icon>
           <Cloudy />
         </el-icon>
@@ -23,30 +27,46 @@
       <div class="nav-section-header">
         <span class="nav-section-title">历史对话</span>
       </div>
-      <div v-if="loading" class="nav-loading">
+      <div v-if="sessionStore.loading" class="nav-loading">
         <el-icon class="is-loading"><Loading /></el-icon>
         <span>加载中...</span>
       </div>
       <template v-else>
         <div
-          v-for="item in historyItems"
+          v-for="item in sessionStore.sessions"
           :key="item.id"
           class="nav-sub-item"
-          :class="{ 'menu-open': openMenuId === item.id, active: currentSessionId === item.id }"
+          :class="{ 'menu-open': openMenuId === item.id, active: sidebarActiveSessionId === item.id }"
           @click="handleSelectSession(item.id)"
         >
           <el-icon class="history-icon"><ChatDotRound /></el-icon>
           <div class="history-content">
             <span class="history-title">{{ item.title }}</span>
           </div>
-          <el-icon v-if="item.pinned" class="history-pin"><Top /></el-icon>
-          <button class="nav-sub-item-more" @click.stop="toggleMenu(item.id, $event)">···</button>
-          <div v-if="openMenuId === item.id" class="nav-more-dropdown">
-            <button @click="handleRename(item)" v-if="!item.isNew">重命名</button>
-            <button @click="handlePin(item)">
+          <div class="nav-actions">
+            <svg
+              v-if="item.pinned"
+              class="history-pin"
+              viewBox="0 0 1024 1024"
+              xmlns="http://www.w3.org/2000/svg"
+              width="26"
+              height="26"
+            >
+              <path
+                d="M595.694933 211.080533a25.6 25.6 0 0 0-43.690666 18.158934l0.2048 72.669866a42.666667 42.666667 0 0 1-12.4928 30.3104l-30.8224 30.788267a42.666667 42.666667 0 0 1-29.5936 12.4928l-148.548267 1.9456c-31.675733 0.4096-47.274667 38.775467-24.849067 61.201067l116.462934 116.462933-152.507734 173.397333a18.193067 18.193067 0 0 0 25.668267 25.634134l173.3632-152.541867 116.462933 116.462933c22.391467 22.4256 60.757333 6.826667 61.166934-24.849066l1.9456-148.548267a42.666667 42.666667 0 0 1 12.4928-29.5936l30.788266-30.8224a42.666667 42.666667 0 0 1 30.3104-12.4928l72.669867 0.238933a25.6 25.6 0 0 0 18.193067-43.690666l-217.224534-217.224534z m7.714134 90.658134l-0.034134-10.581334 129.4336 129.4336h-10.581333a93.866667 93.866667 0 0 0-66.6624 27.477334l-30.8224 30.788266a93.866667 93.866667 0 0 0-27.477333 65.160534l-1.467734 112.128-227.9424-227.976534 112.093867-1.467733a93.866667 93.866667 0 0 0 65.160533-27.477333l30.788267-30.8224a93.866667 93.866667 0 0 0 27.511467-66.6624z"
+              ></path>
+            </svg>
+            <button class="nav-sub-item-more" @click.stop="toggleMenu(item.id, $event)">···</button>
+          </div>
+          <div
+            class="nav-more-dropdown floating-dropdown-panel"
+            :class="{ 'is-open': openMenuId === item.id }"
+          >
+            <button @click.stop="handleRename(item)">重命名</button>
+            <button @click.stop="handlePin(item)">
               {{ item.pinned ? '取消置顶' : '置顶' }}
             </button>
-            <button class="danger" @click="handleDelete(item)" v-if="!item.isNew">删除</button>
+            <button class="danger" @click.stop="handleDelete(item)">删除</button>
           </div>
         </div>
       </template>
@@ -83,113 +103,76 @@
 </template>
 
 <script setup lang="ts">
-import { deleteConversation, listConversations, updateConversation } from '@/api';
+/**
+ * 公共布局左侧 Sidebar。
+ *
+ * 不再持有任何会话列表/当前会话状态：
+ *   - 会话列表来源：useSessionStore().sessions（mount 时由 MainLayout 触发 loadHistory）；
+ *   - 当前会话来源：route.params.sessionId（URL 是唯一真理源）；
+ *   - 所有跳转通过 router.push({ name, params }) 完成（hash 模式下走 name 比 path 安全）。
+ */
+import { useSessionStore } from '@/stores/session';
 import { useUserStore } from '@/stores/user';
-import { ChatDotRound, Cloudy, EditPen, Loading, Switch, Top } from '@element-plus/icons-vue';
+import { ChatDotRound, Cloudy, EditPen, Loading, Paperclip, Switch } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 
 const userStore = useUserStore();
+const sessionStore = useSessionStore();
+const route = useRoute();
+const router = useRouter();
 
-const props = defineProps({
-  currentSessionId: {
-    type: String,
-    default: null,
-  },
-});
-
-const emit = defineEmits([
-  'new-chat',
-  'select-session',
-  'session-deleted',
-  'open-cloud-disk',
-  'switch-version',
-]);
-
-const handleCloudDisk = () => {
-  emit('open-cloud-disk');
-};
-
-const handleSwitchVersion = () => {
-  emit('switch-version');
-};
-
-const loading = ref(false);
-const historyItems = ref<ChatSession[]>([]);
 const openMenuId = ref<string | null>(null);
+const sidebarRootRef = ref<HTMLElement | null>(null);
+
 const renameDialogVisible = ref(false);
 const renameTitle = ref('');
 const renameItem = ref<ChatSession | null>(null);
 const renameLoading = ref(false);
-const sidebarRootRef = ref<HTMLElement | null>(null);
-const suppressOutsideCloseOnce = ref(false);
-const draftPrefix = 'local-';
 
-const createLocalDraft = (): ChatSession => {
-  const now = new Date().toISOString();
-  return {
-    id: `${draftPrefix}${Date.now()}`,
-    title: '新对话',
-    pinned: false,
-    isNew: true,
-    createdAt: now,
-    updatedAt: now,
-  };
-};
+/** 当前会话来自 URL，避免 Sidebar 与 ChatView 出现状态漂移。 */
+const currentSessionId = computed(() => {
+  const raw = route.params.sessionId;
+  return typeof raw === 'string' ? raw : '';
+});
 
-const loadHistory = async () => {
-  loading.value = true;
-  try {
-    const draftItems = historyItems.value.filter((item) => item.isNew);
-    const list = (await listConversations()).map((item) => ({
-      id: item.id,
-      title: item.title,
-      pinned: item.pinned,
-      updatedAt: item.updatedAt,
-      createdAt: item.updatedAt,
-    }));
-    list.sort((a, b) => {
-      if (a.pinned && !b.pinned) return -1;
-      if (!a.pinned && b.pinned) return 1;
-      return 0;
-    });
-    historyItems.value = [...draftItems, ...list];
-  } catch (error) {
-    console.error('加载历史会话失败:', error);
-    ElMessage.error('加载历史会话失败');
-  } finally {
-    loading.value = false;
+/** 高亮项：优先路由 id；在 /chat 无 id 的新会话上，用 store 中的 scratch 真实会话 id。 */
+const sidebarActiveSessionId = computed(() => {
+  if (currentSessionId.value) return currentSessionId.value;
+  return sessionStore.scratchActiveSessionId || '';
+});
+
+const isWorkspaceActive = computed(() => route.name === 'workspace');
+
+const handleNewChat = () => {
+  // 始终触发一次重置信号 —— 即便已经在 /chat（URL 不变），ChatView 也能据此清掉
+  // 仍然挂在内存里的临时会话（messages / activeStream / activeRealSessionId）。
+  sessionStore.requestReset();
+  // 仅当不在 /chat 欢迎页（带了 sessionId 或在别的路由）时才需要 push，避免 NavigationDuplicated 警告。
+  if (route.name !== 'chat' || currentSessionId.value !== '') {
+    router.push({ name: 'chat' });
   }
 };
 
-const handleNewChat = async () => {
-  if (historyItems.value.some((v) => v.isNew)) {
-    ElMessage.warning('已存在新会话');
-    return;
-  }
-  const draft = createLocalDraft();
-  historyItems.value.unshift(draft);
-  emit('new-chat', draft);
+const handleCloudDisk = () => {
+  router.push({ name: 'workspace' });
+};
+
+const handleSwitchVersion = () => {
+  // 占位：旧版本切换暂时由产品定义。
+  ElMessage.info('切换旧版本功能待接入');
 };
 
 const handleSelectSession = (sessionId: string) => {
-  if (sessionId !== props.currentSessionId) {
-    emit('select-session', sessionId);
-  }
   openMenuId.value = null;
+  if (sessionId === sidebarActiveSessionId.value && route.name === 'chat') return;
+  router.push({ name: 'chat', params: { sessionId } });
 };
 
 const toggleMenu = (id: string, event?: MouseEvent) => {
   if (event) event.stopPropagation();
-  suppressOutsideCloseOnce.value = true;
   openMenuId.value = openMenuId.value === id ? null : id;
-  requestAnimationFrame(() => {
-    suppressOutsideCloseOnce.value = false;
-  });
-};
-
-const closeMenu = () => {
-  openMenuId.value = null;
 };
 
 const handleRename = (item: ChatSession) => {
@@ -204,19 +187,12 @@ const confirmRename = async () => {
     ElMessage.warning('请输入对话名称');
     return;
   }
+  if (!renameItem.value) return;
   renameLoading.value = true;
   try {
-    if (renameItem.value) {
-      if (!renameItem.value.isNew) {
-        await updateConversation(renameItem.value.id, { title: renameTitle.value.trim() });
-      }
-      const item = historyItems.value.find((i) => i.id === renameItem.value?.id);
-      if (item) {
-        item.title = renameTitle.value.trim();
-      }
-      renameDialogVisible.value = false;
-      ElMessage.success('重命名成功');
-    }
+    await sessionStore.renameSession(renameItem.value.id, renameTitle.value.trim());
+    renameDialogVisible.value = false;
+    ElMessage.success('重命名成功');
   } catch (error) {
     console.error('重命名失败:', error);
     ElMessage.error('重命名失败');
@@ -226,19 +202,9 @@ const confirmRename = async () => {
 };
 
 const handlePin = async (item: ChatSession) => {
-  if (item.isNew) {
-    ElMessage.warning('新会话不支持置顶');
-    return;
-  }
   try {
-    await updateConversation(item.id, { pinned: !item.pinned });
-    item.pinned = !item.pinned;
-    historyItems.value.sort((a, b) => {
-      if (a.pinned && !b.pinned) return -1;
-      if (!a.pinned && b.pinned) return 1;
-      return 0;
-    });
-    ElMessage.success(item.pinned ? '已置顶' : '已取消置顶');
+    const next = await sessionStore.togglePin(item.id);
+    ElMessage.success(next ? '已置顶' : '已取消置顶');
   } catch (error) {
     console.error('置顶操作失败:', error);
     ElMessage.error('操作失败');
@@ -253,24 +219,10 @@ const handleDelete = async (item: ChatSession) => {
       cancelButtonText: '取消',
       type: 'warning',
     });
-    if (!item.isNew) {
-      await deleteConversation(item.id);
-    }
-    const index = historyItems.value.findIndex((i) => i.id === item.id);
-    if (index > -1) {
-      historyItems.value.splice(index, 1);
-    }
-    if (item.id === props.currentSessionId) {
-      const draft = historyItems.value.find((v) => v.isNew);
-      if (draft) {
-        emit('new-chat', draft);
-      } else {
-        const created = createLocalDraft();
-        historyItems.value.unshift(created);
-        emit('new-chat', created);
-      }
-    } else {
-      emit('session-deleted', item.id);
+    await sessionStore.removeSession(item.id);
+    // 删除的若是当前会话，回到 /chat 欢迎页；否则保持当前路由不变。
+    if (item.id === currentSessionId.value) {
+      router.replace({ name: 'chat' });
     }
     ElMessage.success('删除成功');
   } catch (error) {
@@ -282,43 +234,8 @@ const handleDelete = async (item: ChatSession) => {
   openMenuId.value = null;
 };
 
-const addSession = (session: ChatSession) => {
-  const exists = historyItems.value.find((i) => i.id === session.id);
-  if (!exists) {
-    historyItems.value.unshift(session);
-  }
-};
-
-const replaceSessionId = (fromId: string, toId: string, title?: string) => {
-  const item = historyItems.value.find((i) => i.id === fromId);
-  if (!item) return;
-  item.id = toId;
-  item.isNew = false;
-  if (title) item.title = title;
-};
-
-const updateSessionTitle = (sessionId: string, title: string) => {
-  const item = historyItems.value.find((i) => i.id === sessionId);
-  if (item && item.isNew) {
-    item.title = title;
-    item.isNew = false;
-  }
-};
-
-watch(
-  () => props.currentSessionId,
-  (newId) => {
-    if (newId) {
-      const exists = historyItems.value.find((i) => i.id === newId);
-      if (!exists) {
-        loadHistory();
-      }
-    }
-  }
-);
-
-const handleClickOutside = (event: MouseEvent) => {
-  if (suppressOutsideCloseOnce.value) return;
+/** 点击外部关闭"更多"菜单。pointerdown + capture 比 click 更稳，不会与按钮 click 冲突。 */
+const handleClickOutside = (event: PointerEvent) => {
   const root = sidebarRootRef.value;
   const target = event.target as Node | null;
   if (!root || !target) return;
@@ -326,20 +243,23 @@ const handleClickOutside = (event: MouseEvent) => {
 };
 
 onMounted(() => {
-  loadHistory();
-  document.addEventListener('click', handleClickOutside);
+  document.addEventListener('pointerdown', handleClickOutside, true);
 });
 
 onUnmounted(() => {
-  document.removeEventListener('click', handleClickOutside);
+  document.removeEventListener('pointerdown', handleClickOutside, true);
 });
 
-defineExpose({
-  addSession,
-  replaceSessionId,
-  updateSessionTitle,
-  loadHistory,
-});
+// 路由切换时关闭打开的菜单与重命名弹窗，避免跨页残留。
+// Sidebar 所在的 MainLayout 不会因 /chat ↔ /workspace 切换而卸载，
+// 因此用 watch(route.fullPath) 而非 onBeforeRouteLeave。
+watch(
+  () => route.fullPath,
+  () => {
+    openMenuId.value = null;
+    renameDialogVisible.value = false;
+  }
+);
 </script>
 
 <style scoped lang="scss">
@@ -429,6 +349,16 @@ defineExpose({
 
   &:active {
     background: #f3f4f6;
+  }
+
+  &.active {
+    background: rgba(0, 47, 134, 0.08);
+    color: var(--primary);
+    border-color: var(--primary-border, rgba(0, 47, 134, 0.2));
+
+    .el-icon {
+      color: var(--primary);
+    }
   }
 
   .el-icon {
@@ -526,13 +456,28 @@ defineExpose({
 }
 
 .history-pin {
-  font-size: 14px;
-  color: #f59e0b;
+  color: #d97706;
+  position: absolute;
+  top: -2px !important;
+  inset: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 1;
+  transition: opacity 0.12s ease;
+}
+
+.nav-actions {
+  margin-left: auto;
+  width: 22px;
+  height: 22px;
+  position: relative;
   flex-shrink: 0;
 }
 
 .nav-sub-item-more {
-  margin-left: auto;
+  position: absolute;
+  inset: 0;
   opacity: 0;
   width: 22px;
   height: 22px;
@@ -562,29 +507,25 @@ defineExpose({
   opacity: 1;
 }
 
+.nav-sub-item:hover .history-pin,
+.nav-sub-item.menu-open .history-pin {
+  opacity: 0;
+}
+
 .nav-more-dropdown {
-  position: absolute;
   right: 4px;
   top: 32px;
-  z-index: 200;
+  z-index: var(--dropdown-z-index);
   background: var(--surface);
   border: 1px solid var(--outline-variant);
   border-radius: 8px;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
   min-width: 100px;
   overflow: hidden;
-  opacity: 0;
-  transform: translateY(-4px);
-  transition:
-    opacity 0.15s ease,
-    transform 0.15s ease;
-  pointer-events: none;
 }
 
-.nav-sub-item.menu-open .nav-more-dropdown {
-  opacity: 1;
-  transform: translateY(0);
-  pointer-events: auto;
+.nav-more-dropdown.floating-dropdown-panel {
+  transform-origin: top right;
 }
 
 .nav-more-dropdown button {

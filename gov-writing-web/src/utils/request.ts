@@ -1,53 +1,119 @@
 import axios from 'axios'
-import { getBspLoginUrl, getLoginStatus } from '@/api/bspAuth'
+import { getBspLoginUrl, getLoginStatus } from '@/api/auth'
 
-function readJsonSession(key: string): Record<string, unknown> | null {
+/**
+ * Legacy 鉴权头：
+ * - 必填：X-Legacy-User-Id / X-Legacy-Account / X-Legacy-Name
+ * - 可选：X-Legacy-Org-Name / X-Legacy-Org-Code
+ *
+ * 所有值仅来源于 getLoginStatus() 返回的 user 字段：
+ *   - X-Legacy-User-Id  <- user.ID
+ *   - X-Legacy-Account  <- user.ACCOUNT
+ *   - X-Legacy-Name     <- user.NAME
+ *   - X-Legacy-Org-Name <- user.ORG_NAME
+ *   - X-Legacy-Org-Code <- user.ORG_CODE
+ */
+const LEGACY_HEADERS_CACHE_KEY = 'legacy_auth_headers'
+let legacyHeadersCache: Record<string, string> | null = null
+let legacyHeadersLoading: Promise<Record<string, string> | null> | null = null
+
+/**
+ * 浏览器 XHR 要求 header value 必须是 ISO-8859-1 可表示字符。
+ * 对包含中文等非 Latin-1 的值进行 URL 编码，避免 setRequestHeader 抛错。
+ */
+function toSafeHeaderValue(value: string): string {
+  const trimmed = value.trim()
+  if (!trimmed) return ''
+  for (let i = 0; i < trimmed.length; i++) {
+    if (trimmed.charCodeAt(i) > 255) {
+      return encodeURIComponent(trimmed)
+    }
+  }
+  return trimmed
+}
+
+function readLegacyHeadersCache(): Record<string, string> | null {
   try {
-    const raw = sessionStorage.getItem(key)
+    const raw = sessionStorage.getItem(LEGACY_HEADERS_CACHE_KEY)
     if (!raw) return null
-    const v = JSON.parse(raw) as unknown
-    return v && typeof v === 'object' ? (v as Record<string, unknown>) : null
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object') return null
+    const cached = parsed as Record<string, string>
+    // 兼容旧缓存：即便缓存是历史未编码值，也在读取时做一轮安全规范化。
+    const normalized: Record<string, string> = {}
+    for (const [k, v] of Object.entries(cached)) {
+      normalized[k] = toSafeHeaderValue(String(v ?? ''))
+    }
+    return normalized
   } catch {
     return null
   }
 }
 
-/** 三个必填 Legacy Header 必须同时存在才注入，否则走 Cookie / 后端 Mock。 */
-function buildLegacyAuthHeaders(): Record<string, string> | null {
-  if (import.meta.env.VITE_USE_LEGACY_AUTH_HEADER !== 'true') return null
-
-  const u = readJsonSession('user')
-  const pick = (keys: string[]) => {
-    if (!u) return ''
-    for (const k of keys) {
-      const v = u[k]
-      if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim()
+function writeLegacyHeadersCache(headers: Record<string, string> | null) {
+  try {
+    if (!headers) {
+      sessionStorage.removeItem(LEGACY_HEADERS_CACHE_KEY)
+      return
     }
-    return ''
+    sessionStorage.setItem(LEGACY_HEADERS_CACHE_KEY, JSON.stringify(headers))
+  } catch {
+    // ignore cache write failures
+  }
+}
+
+function buildLegacyAuthHeadersFromUser(user: Record<string, unknown> | null): Record<string, string> | null {
+  const pick = (key: string) => {
+    if (!user) return ''
+    const v = user[key]
+    return v === undefined || v === null ? '' : String(v).trim()
   }
 
-  let userId = pick(['ID', 'id', 'userId', 'user_id'])
-  let account = pick(['ACCOUNT', 'account', 'userAccount', 'loginName'])
-  let name = pick(['NAME', 'name', 'userName', 'realName'])
-  const orgName = pick(['ORG_NAME', 'orgName', 'deptName'])
-  const orgCode = pick(['ORG_CODE', 'orgCode', 'deptCode'])
-
-  if (!userId || !account || !name) {
-    userId = (import.meta.env.VITE_LEGACY_USER_ID as string | undefined)?.trim() || ''
-    account = (import.meta.env.VITE_LEGACY_ACCOUNT as string | undefined)?.trim() || ''
-    name = (import.meta.env.VITE_LEGACY_NAME as string | undefined)?.trim() || ''
-  }
-
+  const userId = pick('ID')
+  const account = pick('ACCOUNT')
+  const name = pick('NAME')
+  const orgName = pick('ORG_NAME')
+  const orgCode = pick('ORG_CODE')
   if (!userId || !account || !name) return null
 
   const headers: Record<string, string> = {
-    'X-Legacy-User-Id': userId,
-    'X-Legacy-Account': account,
-    'X-Legacy-Name': name,
+    'X-Legacy-User-Id': toSafeHeaderValue(userId),
+    'X-Legacy-Account': toSafeHeaderValue(account),
+    'X-Legacy-Name': toSafeHeaderValue(name),
   }
-  if (orgName) headers['X-Legacy-Org-Name'] = orgName
-  if (orgCode) headers['X-Legacy-Org-Code'] = orgCode
+  if (orgName) headers['X-Legacy-Org-Name'] = toSafeHeaderValue(orgName)
+  if (orgCode) headers['X-Legacy-Org-Code'] = toSafeHeaderValue(orgCode)
   return headers
+}
+
+async function ensureLegacyAuthHeaders(): Promise<Record<string, string> | null> {
+  if (legacyHeadersCache) return legacyHeadersCache
+  const fromSession = readLegacyHeadersCache()
+  if (fromSession) {
+    legacyHeadersCache = fromSession
+    return fromSession
+  }
+  if (legacyHeadersLoading) return legacyHeadersLoading
+
+  legacyHeadersLoading = (async () => {
+    try {
+      const resp = await getLoginStatus()
+      const code = String(resp.data?.code ?? '')
+      if (code !== '1') return null
+      const user = (resp.data?.data?.user ?? null) as Record<string, unknown> | null
+      const headers = buildLegacyAuthHeadersFromUser(user)
+      if (!headers) return null
+      legacyHeadersCache = headers
+      writeLegacyHeadersCache(headers)
+      return headers
+    } catch {
+      return null
+    } finally {
+      legacyHeadersLoading = null
+    }
+  })()
+
+  return legacyHeadersLoading
 }
 
 const request = axios.create({
@@ -60,12 +126,12 @@ const request = axios.create({
 })
 
 request.interceptors.request.use(
-  (config) => {
+  async (config) => {
     const token = localStorage.getItem('token')
     if (token) {
       config.headers.Authorization = `Bearer ${token}`
     }
-    const legacy = buildLegacyAuthHeaders()
+    const legacy = await ensureLegacyAuthHeaders()
     if (legacy) {
       Object.assign(config.headers, legacy)
     }
@@ -90,6 +156,10 @@ request.interceptors.response.use(
       try {
         const resp = await getLoginStatus()
         const code = String(resp.data?.code ?? '')
+        const user = (resp.data?.data?.user ?? null) as Record<string, unknown> | null
+        const headers = code === '1' ? buildLegacyAuthHeadersFromUser(user) : null
+        legacyHeadersCache = headers
+        writeLegacyHeadersCache(headers)
         if (code !== '1') {
           window.open(getBspLoginUrl(), '_self')
         }

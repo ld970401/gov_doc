@@ -1,29 +1,25 @@
-import ClawStep from './ClawStep.vue';
-import CliStep from './CliStep.vue';
-import DocumentOutputStep from './DocumentOutputStep.vue';
+import CommonStep from './CommonStep.vue';
+import DocumentStep from './DocumentStep.vue';
 import PlainTextStep from './PlainTextStep.vue';
+import PlanTextStep from './PlanTextStep.vue';
 import ReportCardStep from './ReportCardStep.vue';
 import ResultStep from './ResultStep.vue';
-import SkillStep from './SkillStep.vue';
-import SubAgentStep from './SubAgentStep.vue';
+import SearchResultStep from './SearchResultStep.vue';
 import TableCardStep from './TableCardStep.vue';
-import TemplateRecommendStep from './TemplateRecommendStep.vue';
-import ThinkStep from './ThinkStep.vue';
+import TemplateStep from './TemplateStep.vue';
 import ToolStep from './ToolStep.vue';
 
 // 步骤组件映射
 export const stepComponents: Record<string, any> = {
-  think: ThinkStep,
+  common: CommonStep,
+  planText: PlanTextStep,
   tool: ToolStep,
-  claw: ClawStep,
-  skill: SkillStep,
-  cli: CliStep,
-  template: TemplateRecommendStep,
-  subAgent: SubAgentStep,
-  documentOutput: DocumentOutputStep,
+  template: TemplateStep,
+  document: DocumentStep,
   reportCard: ReportCardStep,
   tableCard: TableCardStep,
-  plainText: PlainTextStep,
+  searchResult: SearchResultStep,
+  text: PlainTextStep,
   result: ResultStep,
 };
 

@@ -1,4 +1,4 @@
-/** 与 DocumentOutputStep 公文预览区视觉一致的编辑区样式（写入 TinyMCE iframe） */
+/** 公文预览区视觉一致的编辑区样式（写入 TinyMCE iframe） */
 export const DOC_CONTENT_STYLE = `
   body {
     font-family: 'FangSong_GB2312', '仿宋_GB2312', 'STFangsong', FangSong, 'Noto Serif SC', serif;

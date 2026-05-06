@@ -15,9 +15,10 @@ Runtime 端到端冒烟测试（无网络、无 DB）。
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from app.a2a_runtime import ExecutionStep, build_handoff_content
-from app.agent_capability_adapter import SkillExecutionResult
+from app.agent_capability_adapter import LegacyCallResult, SkillExecutionResult, execute_skill
 from app.event_payload import (
     PLANNING_SUMMARY_TEXT_INDEX,
     PLANNING_THINKING_INDEX,
@@ -254,6 +255,54 @@ class TestWritingDetectionAndNormalization(unittest.TestCase):
         normalized, meta = self.agent._normalize_document_steps("查一下端午放假安排", steps)
         self.assertEqual(len(normalized), 1)
         self.assertIsNone(meta)
+
+    def test_plan_from_json_content(self) -> None:
+        response = {
+            "model_name": "Qwen3-235B-A22B-FP8",
+            "message": {
+                "content": (
+                    '{"intent":"document_workflow","summary":"先检索后写作","steps":['
+                    '{"skillName":"retrieval","title":"资料检索","objective":"检索放假通知要点"},'
+                    '{"skillName":"writing","title":"公文写作","objective":"起草通知正文","dependsOn":[1]}'
+                    "]}"
+                )
+            },
+            "raw": {},
+        }
+        plan, meta = self.agent._plan_from_response("请帮我写一份五一放假通知", response, [])
+        self.assertEqual(meta.get("planner"), "main_agent_json_plan")
+        self.assertEqual([s.skill_name for s in plan.steps], ["retrieval", "writing"])
+        self.assertEqual(plan.steps[1].depends_on, ["step_01_retrieval"])
+
+
+class TestRetrievalExecutionBehavior(unittest.TestCase):
+    def test_legacy_empty_keeps_empty_without_llm_fallback(self) -> None:
+        with patch(
+            "app.agent_capability_adapter._try_legacy_json",
+            return_value=LegacyCallResult(
+                ok=True,
+                url="http://legacy/retrieval",
+                status_code=200,
+                payload={"data": []},
+            ),
+        ), patch("app.agent_capability_adapter._invoke_llm", side_effect=AssertionError("should_not_call_llm")):
+            result = execute_skill("retrieval", "检索五一放假通知", None, [], None)
+        self.assertEqual(result.source_state, "legacy_success")
+        self.assertEqual(result.normalized_result.get("items"), [])
+
+    def test_legacy_error_keeps_empty_without_llm_fallback(self) -> None:
+        with patch(
+            "app.agent_capability_adapter._try_legacy_json",
+            return_value=LegacyCallResult(
+                ok=False,
+                url="http://legacy/retrieval",
+                error="upstream timeout",
+            ),
+        ), patch("app.agent_capability_adapter._invoke_llm", side_effect=AssertionError("should_not_call_llm")):
+            result = execute_skill("retrieval", "检索五一放假通知", None, [], None)
+        self.assertEqual(result.source_state, "legacy_error")
+        self.assertEqual(result.normalized_result.get("items"), [])
+        self.assertEqual(result.error_detail, "upstream timeout")
 
 
 if __name__ == "__main__":

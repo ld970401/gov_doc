@@ -9,7 +9,7 @@ from .registry import AgentRegistry, canonical_agent_name, get_agent_spec
 from app.a2a_runtime import ExecutionPlan, ExecutionStep, build_execution_plan as build_fallback_execution_plan
 from app.config import settings
 from app.debug_log import log_stage
-from app.llm import LLMCallError, call_chat_model_with_messages_raw
+from app.llm import LLMCallError, call_chat_model_with_messages_raw, extract_json_object
 from tools.agent_tool import AgentTool
 
 
@@ -88,13 +88,16 @@ class MainAgent:
             }
 
         messages = self._build_messages(user_message, attachments, runtime_context, memory_context)
-        tool_schema = self.agent_tool.get_tool_schema()
         log_stage(
             "planner.request",
             {
                 "requestedModel": settings.planner_model or requested_model,
                 "messages": messages,
-                "toolSchema": tool_schema,
+                "responseContract": {
+                    "type": "json_plan",
+                    "requiredFields": ["intent", "summary", "steps"],
+                    "stepFields": ["skillName", "objective", "dependsOn"],
+                },
             },
             enabled=settings.debug_runtime_logs,
             max_chars=settings.debug_log_max_chars,
@@ -107,87 +110,17 @@ class MainAgent:
                 if on_planner_stream:
                     on_planner_stream(ev)
 
-            def _call_planner(*, strip_hint: bool = False, tool_choice: str = "auto") -> dict[str, Any]:
-                """实际发起 planner 请求。
-
-                - ``strip_hint`` 为 True 时临时关闭 disable_thinking / chat_template_kwargs，
-                  规避部分网关对未知字段或 /no_think 附加文本不兼容而返回 400/422。
-                - ``tool_choice`` 通常为 ``auto``；对写作类意图可尝试 ``required`` 强制至少一次 tool call
-                  （网关不支持时由外层重试回退为 ``auto``）。
-                """
-                purpose = "planner.retry_no_think_hint" if strip_hint else "planner"
-                if not strip_hint:
-                    return call_chat_model_with_messages_raw(
-                        messages,
-                        settings.planner_model or requested_model,
-                        purpose=purpose,
-                        temperature=settings.planner_temperature,
-                        extra_payload={
-                            "tools": [tool_schema],
-                            "tool_choice": tool_choice,
-                        },
-                        stream=use_stream,
-                        on_stream_event=_stream_cb if use_stream else None,
-                    )
-                _prev = settings.llm_disable_thinking
-                _prev_kwargs = settings.llm_send_chat_template_kwargs
-                try:
-                    settings.llm_disable_thinking = False
-                    settings.llm_send_chat_template_kwargs = False
-                    return call_chat_model_with_messages_raw(
-                        messages,
-                        settings.planner_model or requested_model,
-                        purpose=purpose,
-                        temperature=settings.planner_temperature,
-                        extra_payload={
-                            "tools": [tool_schema],
-                            "tool_choice": tool_choice,
-                        },
-                        stream=use_stream,
-                        on_stream_event=_stream_cb if use_stream else None,
-                    )
-                finally:
-                    settings.llm_disable_thinking = _prev
-                    settings.llm_send_chat_template_kwargs = _prev_kwargs
-
-            writing_intent = self._looks_like_writing_request(user_message)
-            preferred_tool_choice = (
-                "required"
-                if (settings.planner_force_tool_for_writing and writing_intent)
-                else "auto"
-            )
-            # 分步重试：写作意图优先 required；失败则 auto + 正常 hint；再失败则 auto + 去掉 hint。
-            trial_plan: list[tuple[str, bool, str]] = []
-            if preferred_tool_choice == "required":
-                trial_plan.append(("required", False, "planner.tool_choice.required"))
-            trial_plan.append(("auto", False, "planner.tool_choice.auto"))
-            trial_plan.append(("auto", True, "planner.strip_hint_then_auto"))
-
-            last_exc: LLMCallError | None = None
-            response: dict[str, Any] | None = None
-            for tc, strip_hint, strategy in trial_plan:
-                try:
-                    response = _call_planner(strip_hint=strip_hint, tool_choice=tc)
-                    last_exc = None
-                    break
-                except LLMCallError as exc:
-                    last_exc = exc
-                    log_stage(
-                        "planner.retry",
-                        {
-                            "reason": str(exc),
-                            "strategy": strategy,
-                            "toolChoice": tc,
-                            "stripHint": strip_hint,
-                        },
-                        enabled=settings.debug_runtime_logs,
-                        max_chars=settings.debug_log_max_chars,
-                        max_string_chars=settings.debug_log_max_string_chars,
-                    )
-            if response is None:
-                if last_exc is not None:
-                    raise last_exc
-                raise LLMCallError("planner: 无可用响应")
+            def _call_planner() -> dict[str, Any]:
+                """实际发起 planner 请求（纯模型 JSON 规划，不传 tools）。"""
+                return call_chat_model_with_messages_raw(
+                    messages,
+                    settings.planner_model or requested_model,
+                    purpose="planner",
+                    temperature=settings.planner_temperature,
+                    stream=use_stream,
+                    on_stream_event=_stream_cb if use_stream else None,
+                )
+            response = _call_planner()
             message = response.get("message") or {}
             if on_planner_stream:
                 raw_content_flush = self._message_text(message)
@@ -231,7 +164,42 @@ class MainAgent:
             )
             return plan, planner_meta
         except (LLMCallError, ValueError, json.JSONDecodeError) as exc:
-            fallback_plan = build_fallback_execution_plan(user_message, None, attachments)
+            if self._looks_like_writing_request(user_message):
+                retrieval_spec = get_agent_spec("retrieval")
+                writing_spec = get_agent_spec("writing")
+                retrieval_depends_sid = "step_01_retrieval"
+                fallback_plan = ExecutionPlan(
+                    intent="document_workflow",
+                    summary="planner 解析失败，按写作意图回退至检索 + 写作两步计划。",
+                    steps=[
+                        ExecutionStep(
+                            index=1,
+                            skill_name=retrieval_spec.name,
+                            title=retrieval_spec.title,
+                            objective=(
+                                f"围绕用户需求「{(user_message or '').strip()[:80]}」检索可用范例、政策依据与写作要点，"
+                                "产出结构化要点，供后续写作引用。"
+                            ),
+                            scope=retrieval_spec.scope,
+                            subtask_role=retrieval_spec.default_subtask_role,
+                        ),
+                        ExecutionStep(
+                            index=2,
+                            skill_name=writing_spec.name,
+                            title=writing_spec.title,
+                            objective="整合前序检索要点与用户需求，起草完整正文。",
+                            scope=writing_spec.scope,
+                            depends_on=[retrieval_depends_sid],
+                            subtask_role=writing_spec.default_subtask_role,
+                        ),
+                    ],
+                )
+                planner_name = "main_agent_error_writing_fallback"
+                dispatch_mode = "error_auto_retrieval_writing"
+            else:
+                fallback_plan = build_fallback_execution_plan(user_message, None, attachments)
+                planner_name = "main_agent_fallback"
+                dispatch_mode = "main_agent_direct"
             log_stage(
                 "planner.fallback",
                 {
@@ -247,10 +215,10 @@ class MainAgent:
                 max_string_chars=settings.debug_log_max_string_chars,
             )
             return fallback_plan, {
-                "planner": "main_agent_fallback",
+                "planner": planner_name,
                 "fallback": True,
                 "error": str(exc),
-                "dispatchMode": "main_agent_direct",
+                "dispatchMode": dispatch_mode,
             }
 
     def leader_step(
@@ -335,6 +303,96 @@ class MainAgent:
         base = prompt.read_text(encoding="utf-8").strip()
         return base.replace("{{AGENT_REGISTRY_CONTEXT}}", self.registry.to_prompt_context())
 
+    @staticmethod
+    def _sid_by_index(step_infos: list[dict[str, Any]], idx: int) -> str:
+        skill_name = step_infos[idx - 1]["skill_name"]
+        return f"step_{idx:02d}_{skill_name}"
+
+    def _normalize_depends_on(self, dep_values: Any, step_infos: list[dict[str, Any]], current_idx: int) -> list[str]:
+        if not isinstance(dep_values, list):
+            return []
+        deps: list[str] = []
+        for raw in dep_values:
+            sid = ""
+            if isinstance(raw, str):
+                text = raw.strip()
+                if text.startswith("step_"):
+                    sid = text
+                elif text.isdigit():
+                    num = int(text)
+                    if 1 <= num < current_idx:
+                        sid = self._sid_by_index(step_infos, num)
+            elif isinstance(raw, int):
+                if 1 <= raw < current_idx:
+                    sid = self._sid_by_index(step_infos, raw)
+            if sid and sid not in deps:
+                deps.append(sid)
+        return deps
+
+    def _build_plan_from_json(self, user_message: str, plan_data: dict[str, Any]) -> tuple[ExecutionPlan, dict[str, Any] | None]:
+        raw_steps = plan_data.get("steps") or []
+        if not isinstance(raw_steps, list):
+            raise ValueError("planner JSON steps 不是数组")
+        step_infos: list[dict[str, Any]] = []
+        for index, item in enumerate(raw_steps, start=1):
+            if not isinstance(item, dict):
+                continue
+            raw_skill = item.get("skillName") or item.get("agent_name") or item.get("skill") or item.get("agent")
+            skill_name = canonical_agent_name(raw_skill) or "general"
+            spec = get_agent_spec(skill_name)
+            objective = (item.get("task_prompt") or item.get("objective") or spec.default_objective or "").strip()
+            if not objective:
+                objective = spec.default_objective
+            step_infos.append(
+                {
+                    "index": index,
+                    "skill_name": spec.name,
+                    "title": (item.get("title") or spec.title or "").strip() or spec.title,
+                    "objective": objective,
+                    "scope": (item.get("scope") or spec.scope or "").strip() or spec.scope,
+                    "depends_raw": item.get("dependsOn") or item.get("depends_on") or [],
+                    "subtask_role": (item.get("subtaskRole") or item.get("subtask_role") or spec.default_subtask_role),
+                }
+            )
+        if not step_infos:
+            raise ValueError("planner JSON 未包含有效 steps")
+        steps: list[ExecutionStep] = []
+        for info in step_infos:
+            depends_on = self._normalize_depends_on(info["depends_raw"], step_infos, info["index"])
+            steps.append(
+                ExecutionStep(
+                    index=info["index"],
+                    skill_name=info["skill_name"],
+                    title=info["title"],
+                    objective=info["objective"],
+                    scope=info["scope"],
+                    depends_on=depends_on,
+                    subtask_role=info["subtask_role"],
+                )
+            )
+        embedded_reasoning = ""
+        if isinstance(plan_data.get("reasoning"), str):
+            embedded_reasoning = (plan_data.get("reasoning") or "").strip()
+        steps, normalization = self._normalize_document_steps(user_message, steps, embedded_reasoning)
+        summary = (plan_data.get("summary") or "").strip()
+        if not summary:
+            summary = f"主 Agent 已规划 {len(steps)} 个 sub-agent 步骤。"
+        intent = (plan_data.get("intent") or "").strip() or ("document_workflow" if self._looks_like_writing_request(user_message) else "general_chat")
+        requires_user_input = bool(plan_data.get("requiresUserInput"))
+        clarification_question = plan_data.get("clarificationQuestion")
+        if clarification_question is not None and not isinstance(clarification_question, str):
+            clarification_question = str(clarification_question)
+        return (
+            ExecutionPlan(
+                intent=intent,
+                summary=summary,
+                steps=steps,
+                requires_user_input=requires_user_input,
+                clarification_question=clarification_question,
+            ),
+            normalization,
+        )
+
     def _plan_from_response(
         self,
         user_message: str,
@@ -350,6 +408,25 @@ class MainAgent:
         embedded_reasoning, assistant_text_body = split_think_content(raw_content)
         assistant_text = assistant_text_body.strip()
         reasoning_content = raw_reasoning or embedded_reasoning
+        try:
+            plan_data = extract_json_object(assistant_text)
+            plan, normalization = self._build_plan_from_json(user_message, plan_data)
+            return (
+                plan,
+                {
+                    "planner": "main_agent_json_plan",
+                    "fallback": False,
+                    "dispatchMode": "json_plan",
+                    "modelName": response["model_name"],
+                    "assistantText": assistant_text,
+                    "reasoningContent": reasoning_content,
+                    "normalization": normalization,
+                    "raw": response["raw"],
+                },
+            )
+        except (LLMCallError, ValueError, json.JSONDecodeError):
+            pass
+
         if tool_calls:
             steps: list[ExecutionStep] = []
             previous_step_ids: list[str] = []

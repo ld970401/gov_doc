@@ -31,81 +31,25 @@ MODEL_ALIASES = {
 }
 
 
+def _clip_text(value: str, max_chars: int) -> str:
+    """截断长文本，避免构造超长上下文导致模型慢/超时。"""
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + "\n...(truncated)"
+
+
+def _timeout_for_purpose(purpose: str, stream: bool) -> float:
+    """按调用场景动态超时：写作链路默认更长。"""
+    base = float(settings.llm_timeout_seconds)
+    if "skill.writing" in (purpose or ""):
+        # 写作通常 token 更大，且网关在 stream/non-stream 都可能慢于规划与检索。
+        return max(base, 180.0 if stream else 150.0)
+    return base
+
+
 class LLMCallError(RuntimeError):
     """LLM 调用异常类，用于表示模型调用过程中的错误。"""
     pass
-
-
-def _is_qwen_family(model_name: str | None) -> bool:
-    """判断模型是否属于 Qwen 家族（Qwen3 / Qwen3.5 / qwen... 等）。
-
-    仅对 Qwen 系启用关闭 thinking 的 hint，避免给 MiniMax 等不识别该约定的模型
-    注入无意义字段（虽然绝大多数网关会忽略未知字段，但仍尽量保守）。
-    """
-    lower = (model_name or "").lower()
-    return lower.startswith("qwen")
-
-
-def _apply_disable_thinking(
-    payload: dict[str, Any],
-    model_name: str,
-    messages: list[dict[str, Any]],
-    *,
-    include_kwargs: bool | None = None,
-) -> list[dict[str, Any]]:
-    """为 Qwen 系模型注入关闭 thinking 的请求参数。
-
-    默认只做一件事（最稳妥）：
-    - 在最后一条 user / system 消息尾部追加 ``/no_think``。
-      Qwen3 chat template 在内部匹配该 token 并跳过 <think> 段；
-      对不识别该约定的模型也是无害文本，不会触发网关参数校验错误。
-
-    仅当 ``include_kwargs=True`` 或 settings.llm_send_chat_template_kwargs 显式开启时，
-    额外在顶层注入 ``chat_template_kwargs = {"enable_thinking": false}``。该字段仅
-    部分网关（官方 vLLM / SGLang 较新版本）识别；老旧私有化部署会以 400 拒绝，
-    导致 planner LLMCallError 回退成 general，这是上一版出现的故障根因。
-
-    返回用于实际发送的 messages（深拷贝，不污染调用方对象）。
-    调用方已显式传入 chat_template_kwargs 时不再覆盖。
-    """
-    if not settings.llm_disable_thinking or not _is_qwen_family(model_name):
-        return messages
-
-    # 是否携带额外的 chat_template_kwargs —— 默认关闭以保证兼容性
-    should_send_kwargs = (
-        include_kwargs if include_kwargs is not None else settings.llm_send_chat_template_kwargs
-    )
-    if should_send_kwargs:
-        payload.setdefault("chat_template_kwargs", {"enable_thinking": False})
-
-    # 深拷贝 messages，避免修改调用方持有的对象。
-    send_messages: list[dict[str, Any]] = [dict(m) for m in messages]
-    no_think_tag = "/no_think"
-    for item in reversed(send_messages):
-        role = item.get("role")
-        if role not in ("user", "system"):
-            continue
-        content = item.get("content")
-        if isinstance(content, str):
-            if no_think_tag in content:
-                break
-            sep = "" if content.endswith(("\n", " ")) else "\n"
-            item["content"] = f"{content}{sep}{no_think_tag}"
-            break
-        if isinstance(content, list):
-            # OpenAI multimodal 消息格式：content 为部件数组
-            already = any(
-                isinstance(part, dict)
-                and part.get("type") in {"text", "output_text"}
-                and no_think_tag in (part.get("text") or "")
-                for part in content
-            )
-            if already:
-                break
-            content.append({"type": "text", "text": no_think_tag})
-            item["content"] = content
-            break
-    return send_messages
 
 
 # 辅助函数：获取完整的 chat/completions API URL
@@ -143,8 +87,9 @@ def build_messages(
     task_packet: dict | None = None,  # 任务包
 ):
     """构建消息列表，包含系统提示和各种上下文信息。"""
+    skill_name = canonical_agent_name(skill) or "general"
     # 获取对应技能的系统提示词
-    system_prompt = system_prompt_for_agent(canonical_agent_name(skill) or "general")
+    system_prompt = system_prompt_for_agent(skill_name)
     # 初始化消息列表，添加系统提示
     messages = [{"role": "system", "content": system_prompt}]
 
@@ -168,14 +113,19 @@ def build_messages(
         summary = runtime_context.get("summary") or ""  # 上下文摘要
         recent_messages = runtime_context.get("recent_messages") or []  # 最近消息
         if summary:
+            if skill_name == "writing":
+                summary = _clip_text(summary, 1200)
             context_lines.append("运行上下文摘要：")
             context_lines.append(summary)
         if recent_messages:
             context_lines.append("最近消息：")
-            # 只取最近 4 条消息，避免上下文过长
-            for item in recent_messages[-4:]:
+            # 写作场景减少注入消息条数，降低 token 与延迟。
+            keep_recent = 2 if skill_name == "writing" else 4
+            for item in recent_messages[-keep_recent:]:
                 role = item.get("role") or "unknown"
                 text = (item.get("content") or "").strip()
+                if skill_name == "writing":
+                    text = _clip_text(text, 300)
                 context_lines.append(f"- {role}: {text}")
 
     # 添加记忆上下文（如果有）
@@ -186,6 +136,11 @@ def build_messages(
         memory_md = (memory_context.get("memory_markdown") or "").strip()
         # 最近会话摘要
         session_summary = (memory_context.get("session_summary_markdown") or "").strip()
+
+        if skill_name == "writing":
+            identify_md = _clip_text(identify_md, 800) if identify_md else ""
+            memory_md = _clip_text(memory_md, 1200) if memory_md else ""
+            session_summary = _clip_text(session_summary, 600) if session_summary else ""
 
         if identify_md:
             context_lines.append("用户身份偏好：")
@@ -348,13 +303,10 @@ def call_chat_model_with_messages_raw(
     if extra_payload:
         payload.update(extra_payload)
 
-    # 关闭 Qwen3 的 thinking 模式（仅对 Qwen 家族生效）：
-    # 显著提升 tool_call 的触发率，并避免前端看到 <think>...</think> 的重复输出。
-    send_messages = _apply_disable_thinking(payload, model_name, messages)
-    payload["messages"] = send_messages
-
     # 获取 API URL
     post_url = chat_completions_post_url()
+
+    timeout_seconds = _timeout_for_purpose(purpose, stream)
 
     # 记录调试日志
     log_stage(
@@ -364,7 +316,7 @@ def call_chat_model_with_messages_raw(
             "model": model_name,
             "requested_model": requested_model,
             "purpose": purpose,
-            "timeoutSeconds": settings.llm_timeout_seconds,
+            "timeoutSeconds": timeout_seconds,
             "payload": payload,
         },
         enabled=settings.debug_runtime_logs,
@@ -385,7 +337,7 @@ def call_chat_model_with_messages_raw(
                 "Content-Type": "application/json",  # 内容类型
             },
             json=payload,  # 请求体
-            timeout=settings.llm_timeout_seconds,  # 超时设置
+            timeout=timeout_seconds,  # 超时设置（按场景动态）
             stream=stream,  # 是否流式响应
         )
 
@@ -403,6 +355,7 @@ def call_chat_model_with_messages_raw(
             reasoning_parts: list[str] = []
             tool_calls: list[dict] = []
             chunks: list[dict] = []
+            message_text_fallback = ""
 
             thinking_block_active = False
             text_block_active = False
@@ -447,12 +400,23 @@ def call_chat_model_with_messages_raw(
                 if not choices:
                     continue
 
-                delta = choices[0].get("delta") or {}
+                first_choice = choices[0] if isinstance(choices[0], dict) else {}
+                delta = first_choice.get("delta") or {}
                 delta_text = _coerce_delta_text(delta.get("content"))
                 delta_reasoning = _coerce_delta_text(
                     delta.get("reasoning_content") or delta.get("reasoning") or delta.get("reasoningContent")
                 )
                 delta_tool_calls = delta.get("tool_calls") or []
+                # 兼容部分 OpenAI 网关：流式 chunk 里不放 delta.content，
+                # 而在 choices[0].message.content 返回完整文本。
+                chunk_message = first_choice.get("message") or {}
+                if not delta_text and isinstance(chunk_message, dict):
+                    chunk_message_text = _coerce_message_text(chunk_message)
+                    if chunk_message_text:
+                        message_text_fallback = chunk_message_text
+                    chunk_message_tool_calls = chunk_message.get("tool_calls") or []
+                    if chunk_message_tool_calls:
+                        delta_tool_calls = chunk_message_tool_calls
 
                 if delta_reasoning:
                     if not thinking_block_active:
@@ -532,6 +496,8 @@ def call_chat_model_with_messages_raw(
                     on_stream_event({"type": "content_block_stop", "index": idx})
 
             text = "".join(text_parts).strip()
+            if not text and message_text_fallback:
+                text = message_text_fallback.strip()
             reasoning_content = "".join(reasoning_parts).strip()
             message = {
                 "role": "assistant",
@@ -621,12 +587,6 @@ def call_chat_model_with_messages(
         stream=stream,
         on_stream_event=on_stream_event,
     )
-
-    # 彻底清除返回结果中的思考内容（某些 Qwen3 部署即使 disable_thinking 仍会返回 reasoning_content）
-    if response.get("message"):
-        response["message"].pop("reasoning_content", None)
-        response["message"].pop("reasoning", None)
-        response["message"].pop("reasoningContent", None)
 
     # 检查返回内容是否为空
     if not response["text"]:

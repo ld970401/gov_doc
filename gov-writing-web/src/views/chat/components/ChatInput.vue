@@ -13,9 +13,6 @@
         </button>
       </div>
 
-      <!-- 任务进度卡片 -->
-      <TaskProgressCard />
-
       <!-- 聊天输入卡片 -->
       <div class="chat-input-card">
         <!-- 新增：已上传文件列表展示 -->
@@ -33,19 +30,29 @@
         <div class="chat-input-row">
           <!-- 附件按钮 -->
           <div ref="attachWrapperRef" class="attach-popover-wrapper" @click.stop>
-            <button class="attach-btn" @click="toggleAttachPopover" title="添加附件">
+            <button class="attach-btn" @click.stop="toggleAttachPopover" title="添加附件">
               <el-icon><Plus /></el-icon>
             </button>
-            <div class="attach-popover" :class="{ open: isAttachPopoverOpen }">
+            <div
+              class="attach-popover floating-dropdown-panel"
+              :class="{ 'is-open': isAttachPopoverOpen }"
+            >
               <!-- 修改：使用 el-upload 触发本地上传 -->
-              <el-upload ref="uploadRef" :auto-upload="false" :show-file-list="false" :on-change="handleFileChange" accept=".doc,.docx,.pdf,.txt,.jpg,.png,.jpeg" style="display: inline-block; width: 100%">
+              <el-upload
+                ref="uploadRef"
+                :auto-upload="false"
+                :show-file-list="false"
+                :on-change="handleFileChange"
+                accept=".doc,.docx,.pdf,.txt,.jpg,.png,.jpeg"
+                style="display: inline-block; width: 100%"
+              >
                 <button class="popover-item">
                   <el-icon><Upload /></el-icon>
                   本地上传
                 </button>
               </el-upload>
 
-              <button class="popover-item" @click="handleCloudSelect">
+              <button class="popover-item" @click.stop="handleCloudSelect">
                 <el-icon><MostlyCloudy /></el-icon>
                 网盘选择
               </button>
@@ -53,18 +60,38 @@
           </div>
 
           <!-- 输入框 -->
-          <input ref="inputRef" v-model="inputText" type="text" class="chat-input-field" :placeholder="inputPlaceholder" @keyup.enter="handleSend" @focus="handleFocus" />
+          <input
+            ref="inputRef"
+            v-model="inputText"
+            type="text"
+            class="chat-input-field"
+            :placeholder="inputPlaceholder"
+            @keyup.enter="handleSend"
+            @focus="handleFocus"
+          />
 
           <!-- 模型选择 -->
           <div ref="modelWrapperRef" class="model-select-wrapper" @click.stop>
-            <button class="btn-model-select" @click="toggleModelDropdown" type="button">
+            <button class="btn-model-select" @click.stop="toggleModelDropdown" type="button">
               <el-icon><ChatLineRound /></el-icon>
-              {{ modelOptions.find((m) => m.key === selectedModel)?.label || selectedModel }}
+              <span class="model-label" :title="selectedModelLabel">
+                {{ selectedModelLabel }}
+              </span>
               <el-icon class="chevron"><ArrowDown /></el-icon>
             </button>
-            <div class="model-dropdown" :class="{ open: isModelDropdownOpen }">
-              <div v-for="model in modelOptions" :key="model.key" class="model-option" :class="{ selected: selectedModel === model.key }" @click="selectModel(model)">
-                {{ model.label }}
+            <div
+              class="model-dropdown floating-dropdown-panel"
+              :class="{ 'is-open': isModelDropdownOpen }"
+            >
+              <div
+                v-for="model in modelOptions"
+                :key="model.key"
+                class="model-option"
+                :class="{ selected: selectedModel === model.key }"
+                @click.stop="selectModel(model)"
+                :title="model.label"
+              >
+                <span class="model-option-label">{{ model.label }}</span>
                 <el-icon class="check-icon"><Check /></el-icon>
               </div>
             </div>
@@ -79,9 +106,18 @@
       </div>
 
       <!-- 技能快捷选择卡片 -->
-      <div class="claw-select-card">
+      <div class="skill-select-card">
         <div class="claw-chips-row">
-          <div v-for="skill in skills" :key="skill.id" class="claw-chip" :class="{ active: selectedSkill === skill.id }" @click="selectSkill(skill)">
+          <div
+            v-for="skill in skills"
+            :key="skill.id"
+            class="claw-chip"
+            :class="{
+              active: selectedSkill === skill.id,
+              disabled: skill.id !== 'retrieval' && skill.id !== 'writing',
+            }"
+            @click="selectSkill(skill)"
+          >
             <span class="claw-icon">
               <el-icon><component :is="skill.icon" /></el-icon>
             </span>
@@ -96,10 +132,24 @@
 <script setup lang="ts">
 import { listModels, listSkills } from '@/api';
 import { useUserStore } from '@/stores/user';
-import { ArrowDown, ChatLineRound, Check, Close, Document, DocumentChecked, DocumentCopy, EditPen, MagicStick, MostlyCloudy, Plus, Promotion, Search, Upload } from '@element-plus/icons-vue';
+import {
+  ArrowDown,
+  ChatLineRound,
+  Check,
+  Close,
+  Document,
+  DocumentChecked,
+  DocumentCopy,
+  EditPen,
+  MagicStick,
+  MostlyCloudy,
+  Plus,
+  Promotion,
+  Search,
+  Upload,
+} from '@element-plus/icons-vue';
 import type { UploadUserFile } from 'element-plus';
 import { computed, markRaw, onMounted, onUnmounted, ref, type Component } from 'vue';
-import TaskProgressCard from './TaskProgressCard.vue';
 
 interface Skill {
   id: string;
@@ -115,17 +165,17 @@ interface SendData {
   model: string;
   claw: string | null;
   skill?: string | null;
+  skillLabel?: string | null;
   files?: UploadUserFile[];
 }
 
 const emit = defineEmits<{
   send: [data: SendData];
-  'claw-select': [claw: string | null];
+  'skill-select': [claw: string | null];
   'prompt-click': [prompt: string];
 }>();
 
 const inputRef = ref<HTMLInputElement | null>(null);
-const uploadRef = ref();
 const attachWrapperRef = ref<HTMLElement | null>(null);
 const modelWrapperRef = ref<HTMLElement | null>(null);
 const inputText = ref('');
@@ -134,7 +184,6 @@ const selectedModel = ref('');
 const selectedSkill = ref<string | null>(null);
 const isAttachPopoverOpen = ref(false);
 const isModelDropdownOpen = ref(false);
-const suppressOutsideCloseOnce = ref(false);
 
 const fileList = ref<UploadUserFile[]>([]);
 
@@ -149,17 +198,20 @@ const skillIconMap: SkillIconMap = {
   layout: markRaw(MagicStick),
 };
 
-const selectedSkillMeta = computed(() => skills.value.find((s) => s.id === selectedSkill.value) || null);
+const selectedSkillMeta = computed(
+  () => skills.value.find((s) => s.id === selectedSkill.value) || null
+);
+const selectedModelLabel = computed(
+  () => modelOptions.value.find((m) => m.key === selectedModel.value)?.label || selectedModel.value
+);
 
-const inputPlaceholder = computed(() => (selectedSkillMeta.value ? `例如：${selectedSkillMeta.value.example}` : '有什么我能帮你的吗？'));
+const inputPlaceholder = computed(() =>
+  selectedSkillMeta.value ? `例如：${selectedSkillMeta.value.example}` : '有什么我能帮你的吗？'
+);
 
 const toggleAttachPopover = () => {
-  suppressOutsideCloseOnce.value = true;
   isAttachPopoverOpen.value = !isAttachPopoverOpen.value;
   isModelDropdownOpen.value = false;
-  requestAnimationFrame(() => {
-    suppressOutsideCloseOnce.value = false;
-  });
 };
 
 const loadSkillOptions = async () => {
@@ -168,7 +220,7 @@ const loadSkillOptions = async () => {
     skills.value = items.map((item) => ({
       id: item.key,
       name: item.title,
-      example: Array.isArray(item.examples) && item.examples.length > 0 ? item.examples[0] : item.summary || '',
+      example: item.examples ? item.examples[0] : '',
       icon: skillIconMap[item.key] || markRaw(MagicStick),
     }));
   } catch (error) {
@@ -178,19 +230,11 @@ const loadSkillOptions = async () => {
 
 const loadModelOptions = async () => {
   try {
-    const fromMe = userStore.me?.authModels || [];
-    if (fromMe.length > 0) {
-      modelOptions.value = fromMe.map((item) => ({
-        key: item.modelName,
-        label: item.modelDisplayName || item.modelName,
-      }));
-    } else {
-      const items = await listModels();
-      modelOptions.value = items.map((item) => ({
-        key: item.modelName,
-        label: item.modelDisplayName || item.modelName,
-      }));
-    }
+    const items = await listModels();
+    modelOptions.value = items.map((item) => ({
+      key: item.modelName,
+      label: item.modelDisplayName,
+    }));
   } catch (error) {
     console.error('加载模型列表失败:', error);
   }
@@ -202,12 +246,8 @@ const loadModelOptions = async () => {
 
 const toggleModelDropdown = (event: Event) => {
   event.stopPropagation();
-  suppressOutsideCloseOnce.value = true;
   isModelDropdownOpen.value = !isModelDropdownOpen.value;
   isAttachPopoverOpen.value = false;
-  requestAnimationFrame(() => {
-    suppressOutsideCloseOnce.value = false;
-  });
 };
 
 const selectModel = (model: { key: string; label: string }) => {
@@ -216,27 +256,31 @@ const selectModel = (model: { key: string; label: string }) => {
 };
 
 const selectSkill = (skill: Skill) => {
-  if (selectedSkill.value === skill.id) {
-    selectedSkill.value = null;
-  } else {
-    selectedSkill.value = skill.id;
+  if (skill.id === 'retrieval' || skill.id === 'writing') {
+    if (selectedSkill.value === skill.id) {
+      selectedSkill.value = null;
+    } else {
+      selectedSkill.value = skill.id;
+    }
+    emit('skill-select', selectedSkillMeta.value?.id || null);
   }
-  emit('claw-select', selectedSkillMeta.value?.name || null);
 };
 
 const clearSkill = () => {
   selectedSkill.value = null;
-  emit('claw-select', null);
+  emit('skill-select', null);
 };
 
 const handleSend = () => {
   if (inputText.value.trim() || fileList.value.length > 0) {
     const skillKey = selectedSkillMeta.value?.id || null;
+    const skillName = selectedSkillMeta.value?.name || null;
     emit('send', {
       text: inputText.value,
       model: selectedModel.value,
       claw: skillKey,
       skill: skillKey,
+      skillLabel: skillName,
       files: [...fileList.value],
     });
     inputText.value = '';
@@ -291,8 +335,7 @@ defineExpose({
 });
 
 // 点击外部关闭下拉菜单
-const closeDropdowns = (event: Event) => {
-  if (suppressOutsideCloseOnce.value) return;
+const closeDropdowns = (event: PointerEvent) => {
   const target = event.target as Node | null;
   if (!target) return;
   const inAttach = !!attachWrapperRef.value?.contains(target);
@@ -308,11 +351,12 @@ const closeDropdowns = (event: Event) => {
 onMounted(() => {
   void loadSkillOptions();
   void loadModelOptions();
-  document.addEventListener('click', closeDropdowns);
+  // 使用 pointerdown capture 统一处理外部点击，避免 click + raf 抑制导致的闪烁。
+  document.addEventListener('pointerdown', closeDropdowns, true);
 });
 
 onUnmounted(() => {
-  document.removeEventListener('click', closeDropdowns);
+  document.removeEventListener('pointerdown', closeDropdowns, true);
 });
 </script>
 
@@ -502,7 +546,6 @@ onUnmounted(() => {
 }
 
 .attach-popover {
-  position: absolute;
   bottom: calc(100% + 8px);
   left: 0;
   background: var(--surface);
@@ -511,12 +554,7 @@ onUnmounted(() => {
   box-shadow: var(--shadow-3);
   padding: 4px;
   min-width: 160px;
-  z-index: 100;
-  display: none;
-
-  &.open {
-    display: block;
-  }
+  z-index: var(--dropdown-z-index);
 
   :deep(.el-upload) {
     width: 100%;
@@ -604,8 +642,15 @@ onUnmounted(() => {
   }
 }
 
+.model-label {
+  display: inline-block;
+  max-width: 168px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .model-dropdown {
-  position: absolute;
   bottom: calc(100% + 8px);
   right: 0;
   background: var(--surface);
@@ -614,18 +659,14 @@ onUnmounted(() => {
   box-shadow: var(--shadow-3);
   padding: 4px;
   min-width: 168px;
-  z-index: 100;
-  display: none;
-
-  &.open {
-    display: block;
-  }
+  z-index: var(--dropdown-z-index);
 }
 
 .model-option {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 10px;
   padding: 10px 14px;
   font-size: 14px;
   color: var(--on-surface);
@@ -650,7 +691,16 @@ onUnmounted(() => {
     font-size: 16px;
     color: var(--primary);
     visibility: hidden;
+    flex-shrink: 0;
   }
+}
+
+.model-option-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .btn-send {
@@ -686,7 +736,7 @@ onUnmounted(() => {
   }
 }
 
-.claw-select-card {
+.skill-select-card {
   width: 100%;
   border: none;
   border-radius: 20px;
@@ -697,6 +747,7 @@ onUnmounted(() => {
 
 .claw-chips-row {
   display: flex;
+  justify-content: center;
   gap: 8px;
   flex-wrap: wrap;
 }
@@ -730,6 +781,11 @@ onUnmounted(() => {
     background: var(--primary);
     color: #ffffff;
     border-color: transparent;
+  }
+
+  &.disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
   }
 }
 

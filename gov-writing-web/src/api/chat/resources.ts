@@ -6,10 +6,21 @@ type ApiEnvelope<T> = {
   data: T;
 };
 
+export interface ModelItem {
+  id: string;
+  label: string;
+}
+
+export async function listModels(): Promise<ModelItem[]> {
+  const res = (await request.get('/models')) as ApiEnvelope<ModelItem[]>;
+  return Array.isArray(res.data) ? res.data : [];
+}
+
 export interface SkillItem {
   key: string;
   title: string;
   summary: string;
+  example: string;
   examples: string[];
 }
 

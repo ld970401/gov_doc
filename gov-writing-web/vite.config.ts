@@ -34,13 +34,13 @@ export default defineConfig({
         secure: false,
       },
       '/api/agentloop': {
-        target: 'http://localhost:8000',
+        target: 'http://10.108.8.116:8000',
         changeOrigin: true,
         secure: false,
       },
     },
   },
   build: {
-    outDir: 'dist/ai-police',
+    outDir: 'dist/document-chat',
   },
 });

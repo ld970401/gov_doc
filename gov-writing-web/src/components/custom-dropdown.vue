@@ -66,7 +66,7 @@ const handleConfirm = () => {
 
 <template>
   <Transition name="dropdown">
-    <div v-if="modelValue" class="dropdown-container">
+    <div v-show="modelValue" class="dropdown-container floating-dropdown-panel" :class="{ 'is-open': modelValue }">
       <!-- 标题栏 -->
       <header class="popup-header">
         <h4>选择名单库</h4>
@@ -123,7 +123,6 @@ const handleConfirm = () => {
 <style scoped>
 /* --- 下拉容器 (绝对定位) --- */
 .dropdown-container {
-  position: absolute;
   top: calc(100% + 8px);
   left: 0;
   width: 220px; /* 缩小整体宽度至 220px */
@@ -135,21 +134,23 @@ const handleConfirm = () => {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  z-index: 1000;
+  z-index: var(--dropdown-z-index);
   border: 1px solid #e5e7eb;
-  transform-origin: top; /* 设置动画原点为顶部 */
+  transform-origin: top;
 }
 
-/* --- 动画过渡 (从上到下展开收起) --- */
+/* 保留微动画，仅补充可见性，不再用 scaleY=0 避免文本重绘闪烁 */
 .dropdown-enter-active,
 .dropdown-leave-active {
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  transition:
+    opacity 0.18s ease,
+    transform 0.18s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .dropdown-enter-from,
 .dropdown-leave-to {
   opacity: 0;
-  transform: scaleY(0); /* 纵向缩放为0实现展开收起 */
+  transform: translateY(4px) scale(0.98);
 }
 
 /* --- 标题 --- */

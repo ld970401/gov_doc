@@ -2,7 +2,7 @@
   <div class="agent-step" :class="{ open: isOpen }">
     <div class="step-header" :class="{ clickable: hasContent }" @click="toggleStep">
       <div class="step-icon search-result">
-        <el-icon><Search /></el-icon>
+        <el-icon><Document /></el-icon>
       </div>
       <span class="step-label">
         <span class="step-prefix">检索结果</span>
@@ -10,13 +10,18 @@
       <el-icon v-if="hasContent" class="step-chevron"><ArrowDown /></el-icon>
     </div>
     <div v-if="hasContent && isOpen" class="step-content">
-      <h4 class="result-title">{{ content.title || '已筛出结果' }}</h4>
       <p v-if="content.description" class="result-description">{{ content.description }}</p>
       <div class="result-list">
         <article v-for="(item, idx) in content.articles || []" :key="idx" class="result-card">
           <h5 class="article-title">{{ item.title }}</h5>
-          <p class="article-desc">{{ item.description }}</p>
-          <a class="article-link" :href="item.url || '#'" target="_blank" rel="noopener noreferrer"
+          <p class="article-desc" :title="item.description || ''">{{ item.description }}</p>
+          <!-- url 由后端按需提供；当前 retrieval normalizedResult.items 不带 url，因此这里按存在性条件渲染 -->
+          <a
+            v-if="item.url"
+            class="article-link"
+            :href="item.url"
+            target="_blank"
+            rel="noopener noreferrer"
             >打开原文<el-icon><TopRight /></el-icon
           ></a>
         </article>
@@ -26,7 +31,7 @@
 </template>
 
 <script setup lang="ts">
-import { ArrowDown, TopRight, Search } from '@element-plus/icons-vue';
+import { ArrowDown, Document, TopRight } from '@element-plus/icons-vue';
 import { computed, onMounted, ref } from 'vue';
 
 const props = defineProps<{
@@ -43,8 +48,8 @@ const content = computed(() => (props.step.content || {}) as Record<string, any>
 const hasContent = computed(() => {
   return Boolean(
     content.value.title ||
-      content.value.description ||
-      (content.value.articles && content.value.articles.length)
+    content.value.description ||
+    (content.value.articles && content.value.articles.length)
   );
 });
 
@@ -138,7 +143,7 @@ const toggleStep = () => {
 
 .result-description {
   margin: 0 0 13px;
-  font-size: 16px;
+  font-size: 14px;
   line-height: 1.7;
   color: #555;
 }
@@ -168,6 +173,11 @@ const toggleStep = () => {
   font-size: 12px;
   line-height: 1.6;
   color: #666;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .article-link {

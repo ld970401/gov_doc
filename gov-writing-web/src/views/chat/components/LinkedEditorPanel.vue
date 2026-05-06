@@ -4,7 +4,6 @@
       <div class="linked-editor-head-row">
         <div class="linked-editor-meta">
           <h2 class="linked-doc-title" v-html="docTitleDisplay"></h2>
-          <!-- <p class="linked-doc-hint">{{ hint }}</p> -->
         </div>
         <button
           type="button"
@@ -37,7 +36,7 @@
 <script setup lang="ts">
 import { Close, Document } from '@element-plus/icons-vue';
 import { computed } from 'vue';
-import TinymceDocEditor from './TinymceDocEditor.vue';
+import TinymceDocEditor from '@/components/rich-text/TinymceDocEditor.vue';
 
 const props = defineProps<{
   step: Step;

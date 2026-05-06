@@ -274,7 +274,7 @@ def slim_tool_result_payload(payload: dict[str, Any] | None) -> dict[str, Any] |
     ):
         if key in payload:
             slim[key] = payload[key]
-    if tool == "a2a_planning":
+    if tool in {"a2a_planning", "planner_plan"}:
         slim["steps"] = payload.get("steps")
         slim["plan"] = _slim_plan(payload.get("plan"))
         if "plannerMeta" in payload:

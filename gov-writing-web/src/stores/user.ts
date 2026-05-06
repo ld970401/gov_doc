@@ -1,4 +1,4 @@
-import { getMe, type AgentloopUser } from '@/api/user';
+import { getMe, type AgentloopUser } from '@/api/account';
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 

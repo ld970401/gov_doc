@@ -6,13 +6,21 @@
         <h1 class="cd-title">工作目录</h1>
         <div class="cd-header-actions">
           <div ref="createWrapperRef" class="create-select-wrapper" @click.stop>
-            <button class="btn-create" type="button" @click="toggleCreateDropdown">
+            <button class="btn-create" type="button" @click.stop="toggleCreateDropdown">
               <el-icon><Plus /></el-icon>
               <span>新建</span>
               <el-icon class="chevron"><ArrowDown /></el-icon>
             </button>
-            <div class="cd-dropdown create-dropdown" :class="{ open: isCreateDropdownOpen }">
-              <div v-for="option in createOptions" :key="option.id" class="cd-dropdown-item" @click="handleCreate(option.id)">
+            <div
+              class="cd-dropdown create-dropdown floating-dropdown-panel"
+              :class="{ 'is-open': isCreateDropdownOpen }"
+            >
+              <div
+                v-for="option in createOptions"
+                :key="option.id"
+                class="cd-dropdown-item"
+                @click.stop="handleCreate(option.id)"
+              >
                 <el-icon><component :is="option.icon" /></el-icon>
                 <span>{{ option.label }}</span>
               </div>
@@ -68,8 +76,17 @@
             <div class="cd-td col-opened">{{ item.openedAt }}</div>
             <div class="cd-td col-action" @click.stop>
               <button class="row-action-btn" type="button" :aria-expanded="openActionMenuId === item.id" @click.stop="toggleActionMenu(item.id, $event)">···</button>
-              <div class="cd-dropdown action-dropdown" :class="{ open: openActionMenuId === item.id }">
-                <div v-for="action in rowActions" :key="action.id" class="cd-dropdown-item" :class="{ danger: action.danger }" @click.stop="handleRowAction(action.id, item)">
+              <div
+                class="cd-dropdown action-dropdown floating-dropdown-panel"
+                :class="{ 'is-open': openActionMenuId === item.id }"
+              >
+                <div
+                  v-for="action in rowActions"
+                  :key="action.id"
+                  class="cd-dropdown-item"
+                  :class="{ danger: action.danger, disabled: isActionDisabled(action.id) }"
+                  @click.stop="handleRowAction(action.id, item)"
+                >
                   <el-icon><component :is="action.icon" /></el-icon>
                   <span>{{ action.label }}</span>
                 </div>
@@ -123,6 +140,7 @@ interface RowAction {
   label: string;
   icon: Component;
   danger?: boolean;
+  disabled?: boolean;
 }
 
 const emit = defineEmits<{
@@ -164,7 +182,6 @@ const uploadRef = ref();
 const createWrapperRef = ref<HTMLElement | null>(null);
 const isCreateDropdownOpen = ref(false);
 const openActionMenuId = ref<string | null>(null);
-const suppressOutsideCloseOnce = ref(false);
 
 const promptInputRef = ref<HTMLInputElement | null>(null);
 const promptState = reactive<{
@@ -218,31 +235,26 @@ const createOptions: CreateOption[] = [
 ];
 
 const rowActions: RowAction[] = [
-  { id: 'move-chat', label: '移至对话', icon: markRaw(ChatDotRound) },
-  { id: 'move', label: '移动', icon: markRaw(Rank) },
+  { id: 'move-chat', label: '移至对话', icon: markRaw(ChatDotRound), disabled: true },
+  { id: 'move', label: '移动', icon: markRaw(Rank), disabled: true },
   { id: 'download', label: '下载', icon: markRaw(Download) },
-  { id: 'rename', label: '重命名', icon: markRaw(EditPen) },
+  { id: 'rename', label: '重命名', icon: markRaw(EditPen), disabled: true },
   { id: 'delete', label: '删除', icon: markRaw(Delete), danger: true },
 ];
 
+const isActionDisabled = (actionId: RowAction['id']) =>
+  actionId !== 'download' && actionId !== 'delete';
+
 const toggleCreateDropdown = (event: Event) => {
   event.stopPropagation();
-  suppressOutsideCloseOnce.value = true;
   isCreateDropdownOpen.value = !isCreateDropdownOpen.value;
   openActionMenuId.value = null;
-  nextTick(() => {
-    suppressOutsideCloseOnce.value = false;
-  });
 };
 
 const toggleActionMenu = (id: string, event?: MouseEvent) => {
   event?.stopPropagation();
-  suppressOutsideCloseOnce.value = true;
   openActionMenuId.value = openActionMenuId.value === id ? null : id;
   isCreateDropdownOpen.value = false;
-  nextTick(() => {
-    suppressOutsideCloseOnce.value = false;
-  });
 };
 
 const genId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -290,6 +302,7 @@ const handleRowClick = (item: CloudFile) => {
 };
 
 const handleRowAction = async (actionId: RowAction['id'], item: CloudFile) => {
+  if (isActionDisabled(actionId)) return;
   openActionMenuId.value = null;
   switch (actionId) {
     case 'move-chat':
@@ -332,21 +345,21 @@ const handleRowAction = async (actionId: RowAction['id'], item: CloudFile) => {
   }
 };
 
-const handleClickOutside = (event: MouseEvent) => {
-  if (suppressOutsideCloseOnce.value) return;
+const handleClickOutside = (event: PointerEvent) => {
   const target = event.target as Node | null;
   if (!target) return;
   const inCreate = !!createWrapperRef.value?.contains(target);
+  const inActionMenu = !!(target as HTMLElement).closest('.col-action');
   if (!inCreate) isCreateDropdownOpen.value = false;
-  openActionMenuId.value = null;
+  if (!inActionMenu) openActionMenuId.value = null;
 };
 
 onMounted(() => {
-  document.addEventListener('click', handleClickOutside);
+  document.addEventListener('pointerdown', handleClickOutside, true);
 });
 
 onUnmounted(() => {
-  document.removeEventListener('click', handleClickOutside);
+  document.removeEventListener('pointerdown', handleClickOutside, true);
 });
 </script>
 
@@ -541,19 +554,17 @@ onUnmounted(() => {
 
 /* 统一下拉浮层：样式与 ChatInput 的 model-dropdown 一致 */
 .cd-dropdown {
-  position: absolute;
   background: var(--surface);
   border: 1px solid var(--outline);
   border-radius: 12px;
   box-shadow: var(--shadow-3);
   padding: 4px;
   min-width: 140px;
-  z-index: 100;
-  display: none;
+  z-index: var(--dropdown-z-index);
 }
 
-.cd-dropdown.open {
-  display: block;
+.cd-dropdown.floating-dropdown-panel {
+  transform-origin: top right;
 }
 
 .cd-dropdown-item {
@@ -570,6 +581,19 @@ onUnmounted(() => {
 
   &:hover {
     background: var(--surface-overlay);
+  }
+
+  &.disabled {
+    color: #9ca3af;
+    cursor: not-allowed;
+
+    .el-icon {
+      color: #9ca3af;
+    }
+
+    &:hover {
+      background: transparent;
+    }
   }
 
   &.danger {

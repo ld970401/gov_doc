@@ -56,6 +56,7 @@
 
   /* Easing */
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --dropdown-z-index: 1000;
 
   /* Surface Colors */
   --on-surface: #0f172a;
@@ -155,4 +156,37 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+/*
+ * 全局下拉浮层基类：
+ * 1) 始终绝对定位，不占用文档流高度；
+ * 2) 统一 z-index = 1000；
+ * 3) 通过 visibility/opacity/transform 控制显隐，避免 display:none 带来的闪烁。
+ */
+.floating-dropdown-panel {
+  position: absolute;
+  z-index: var(--dropdown-z-index);
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(4px);
+  transform-origin: top;
+  pointer-events: none;
+  will-change: transform, opacity;
+  backface-visibility: hidden;
+  transition:
+    opacity 0.16s ease,
+    transform 0.16s var(--ease-out),
+    visibility 0s linear 0.16s;
+}
+
+.floating-dropdown-panel.is-open {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+  pointer-events: auto;
+  transition:
+    opacity 0.16s ease,
+    transform 0.16s var(--ease-out),
+    visibility 0s linear 0s;
 }

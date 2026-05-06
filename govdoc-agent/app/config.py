@@ -182,22 +182,6 @@ class Settings:
     # Planner 生成的最大执行步骤数（防止步骤过多导致执行时间过长），默认 5
     planner_max_steps = _llm_int("planner_max_steps", 5)
 
-    # 检测到「公文写作类」用户输入时，Planner 是否强制至少产生一次 tool call（OpenAI 兼容字段 tool_choice: required）。
-    # 可显著减少「只输出自然语言、不下发 dispatch_sub_agent」的情况；若网关不支持 required 会自动回退为 auto。
-    planner_force_tool_for_writing = _llm_bool("planner_force_tool_for_writing", True)
-
-    # 是否关闭 Qwen3 等模型的 thinking 模式。
-    # 开启 thinking 时模型会先产出 <think>...</think>，既降低 tool_call 命中率、
-    # 也让前端看到重复的思考文案。默认关闭思考。
-    # 仅对 Qwen 系模型生效（Qwen3 / Qwen3.5 等）。
-    llm_disable_thinking = _llm_bool("disable_thinking", True)
-
-    # 是否在请求体顶层携带 chat_template_kwargs={"enable_thinking": false}。
-    # 该字段仅部分网关（官方 Qwen3 chat template / 较新的 vLLM）识别；
-    # 很多私有化部署会因"未知字段"直接返回 400，触发 planner LLMCallError 回退。
-    # 默认 False —— 优先依赖安全的 /no_think 文本 hint。确认网关支持后可打开。
-    llm_send_chat_template_kwargs = _llm_bool("send_chat_template_kwargs", False)
-
     # 可用模型列表（用于前端下拉选择）
     llm_available_models = _parse_available_models()
 

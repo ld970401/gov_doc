@@ -1,5 +1,5 @@
 import router from '@/router'
-import { getBspLoginUrl, getLoginStatus } from '@/api/bspAuth'
+import { getBspLoginUrl, getLoginStatus } from '@/api/auth'
 
 const USER_KEY = 'user'
 

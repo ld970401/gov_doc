@@ -6,6 +6,8 @@ interface ImportMetaEnv {
   readonly VITE_LEGACY_USER_ID?: string;
   readonly VITE_LEGACY_ACCOUNT?: string;
   readonly VITE_LEGACY_NAME?: string;
+  readonly VITE_LEGACY_ORG_NAME?: string;
+  readonly VITE_LEGACY_ORG_CODE?: string;
   readonly VITE_BSP_APP_CODE?: string;
 }
 

@@ -20,7 +20,8 @@ export interface ConversationMessage {
   runId?: string;
   role: 'user' | 'assistant' | 'system';
   skillName?: string;
-  content: string;
+  /** 会话详情多为结构化对象；旧数据可能为 JSON 字符串或纯文本 */
+  content?: string | Record<string, unknown>;
   contentHtml?: string;
   model?: string;
   annotations?: unknown[];
@@ -59,15 +60,17 @@ export async function listConversations(): Promise<ConversationListItem[]> {
 }
 
 export async function getConversationDetail(conversationId: string): Promise<ConversationDetail> {
-  const res = (await request.get(`/conversations/${conversationId}`)) as ApiEnvelope<ConversationDetail>;
+  const res = (await request.get(
+    `/conversations/${conversationId}`
+  )) as ApiEnvelope<ConversationDetail>;
   return res.data;
 }
 
 export async function updateConversation(
   conversationId: string,
-  payload: { title?: string; pinned?: boolean },
+  payload: { title?: string; pinned?: boolean }
 ): Promise<boolean> {
-  await request.put(`/conversations/${conversationId}`, payload);
+  await request.patch(`/conversations/${conversationId}`, payload);
   return true;
 }
 
@@ -83,8 +86,11 @@ export async function runNewConversation(payload: RunPayload): Promise<RunRespon
 
 export async function runConversation(
   conversationId: string,
-  payload: RunPayload,
+  payload: RunPayload
 ): Promise<RunResponse> {
-  const res = (await request.post(`/conversations/${conversationId}/run`, payload)) as ApiEnvelope<RunResponse>;
+  const res = (await request.post(
+    `/conversations/${conversationId}/run`,
+    payload
+  )) as ApiEnvelope<RunResponse>;
   return res.data;
 }
