@@ -211,6 +211,12 @@ class Settings:
     # Planner 生成的最大执行步骤数（防止步骤过多导致执行时间过长），默认 5
     planner_max_steps = _llm_int("planner_max_steps", 5)
 
+    # 检测到写作类意图时，是否优先使用 tool_choice=required 调用 Planner（失败会按 main_agent 内策略回落 auto）
+    planner_force_tool_for_writing = _llm_bool("planner_force_tool_for_writing", True)
+
+    # Planner 是否走流式 chat/completions（与 tools 兼容；个别网关 stream+tools 异常时可 false 回退非流式）
+    planner_stream = _llm_bool("planner_stream", True)
+
     # 可用模型列表（用于前端下拉选择）
     llm_available_models = _parse_available_models()
 

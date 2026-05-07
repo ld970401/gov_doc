@@ -599,7 +599,7 @@ def call_chat_model_with_messages_raw(
                 delta_tool_calls = delta.get("tool_calls") or []
                 # 兼容部分 OpenAI 网关：流式 chunk 里不放 delta.content，
                 # 而在 choices[0].message.content 返回完整文本。
-                chunk_message = first_choice.get("message") or {}
+                chunk_message = choice0.get("message") or {}
                 if not delta_text and isinstance(chunk_message, dict):
                     chunk_message_text = _coerce_message_text(chunk_message)
                     if chunk_message_text:

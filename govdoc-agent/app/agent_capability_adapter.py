@@ -298,9 +298,21 @@ def _invoke_llm(
             return
         if ev.get("type") == "content_block_delta" and ev.get("delta", {}).get("type") == "text_delta":
             delta_text = ev["delta"].get("text", "")
-            if delta_text:
-                _stream_handler._accumulated = getattr(_stream_handler, "_accumulated", "") + delta_text
-                on_text_delta(_stream_handler._accumulated, delta_text)
+            if not delta_text:
+                return
+            base = getattr(_stream_handler, "_accumulated", "")
+            # 部分网关在 stream 下一次性返回整段正文，runtime 侧按小片转发以便前端逐段渲染（与写作体验一致）。
+            split_chars = 18
+            if skill_name == "general" and len(delta_text) > split_chars:
+                for i in range(0, len(delta_text), split_chars):
+                    piece = delta_text[i : i + split_chars]
+                    base = base + piece
+                    _stream_handler._accumulated = base
+                    on_text_delta(base, piece)
+            else:
+                base = base + delta_text
+                _stream_handler._accumulated = base
+                on_text_delta(base, delta_text)
         elif ev.get("type") == "content_block_stop":
             _stream_handler._accumulated = ""
 
@@ -540,6 +552,7 @@ def _execute_skill_once(
     )
 
     if skill_name == "general":
+        # 必须把 runtime 传入的 on_text_delta 交给 _invoke_llm，否则流式阶段从不回调，只在末尾误打一次。
         text, source_state, error_detail, reasoning_content = _invoke_llm(
             prompt,
             skill_name,
@@ -547,13 +560,12 @@ def _execute_skill_once(
             runtime_context,
             memory_context,
             task_packet,
-            on_text_delta=None,
+            on_text_delta=on_text_delta,
         )
         # 通用回复：剥离"好的，我可以帮您…"等寒暄前缀与末尾客套，保留自然格式。
         if source_state == "model_success":
             text = clean_general_text(text)
-        if on_text_delta:
-            on_text_delta(text or "", "")
+        # 成功路径下最终 flush 已由 _invoke_llm 发出；此处不再重复 on_text_delta，避免双次 stop/flush。
         result = SkillExecutionResult(
             {"text": text, "source": _normalized_source(source_state)},
             [{"type": "general", "title": "通用回答", "html": text_to_html(text)}],
@@ -597,7 +609,7 @@ def _execute_skill_once(
             },
             cookies,
         )
-        items: list[Any] = []
+        legacy_items: list[Any] = []
         if legacy.ok:
             body = legacy.payload if isinstance(legacy.payload, dict) else {}
             data_payload = body.get("data")
@@ -611,7 +623,7 @@ def _execute_skill_once(
             else:
                 raw_items = data_payload or body.get("rows") or body.get("list") or []
             if isinstance(raw_items, list):
-                items = raw_items
+                legacy_items = raw_items
             elif raw_items is not None:
                 legacy_items = [raw_items]
             log_stage(
@@ -710,14 +722,14 @@ def _execute_skill_once(
         result = SkillExecutionResult(
             {
                 "items": items,
-                "source": _normalized_source(source_state),
+                "source": _normalized_source(fallback_state),
             },
             [{"type": "summary", "title": "检索结果", "html": text_to_html(json.dumps(items[:5], ensure_ascii=False))}],
             [],
             [],
             False,
-            source_state=source_state,
-            error_detail=error_detail,
+            source_state=fallback_state,
+            error_detail=fallback_error,
             reasoning_content=None,
         )
         log_stage(

@@ -29,7 +29,6 @@ from .a2a_runtime import (
 )
 from .event_payload import (
     PLANNING_SUMMARY_TEXT_INDEX,
-    PLANNING_THINKING_INDEX,
     display_text_for_step,
     done_label_for_skill,
     purpose_for_skill,
@@ -78,6 +77,7 @@ from .storage import (
     write_workspace_version,
 )
 from .llm import text_to_html
+from .text_postprocess import clean_general_text
 from tools.agent_tool import AgentTool
 
 
@@ -1645,50 +1645,11 @@ def _html_from_blocks(
 def _make_planner_stream_batcher(
     push_event: Callable[[RuntimeTaskEvent], None],
 ) -> Callable[[dict[str, Any]], None]:
-    """Batch planner SSE chunks into planner_reasoning_delta DB events for early UI updates."""
-    last_flush_len = 0
-    last_t = time.monotonic()
-    batch_chars = 72
-    flush_interval = 0.35
-    thinking_started = False
+    """Planner 中间推理不再通过 SSE 展示；保留签名供 prepare_run 路径传入 on_planner_stream。"""
+    del push_event
 
-    def _emit(display: str) -> None:
-        nonlocal thinking_started
-        if not thinking_started:
-            thinking_started = True
-            push_event(RuntimeTaskEvent(
-                type="content_block_start",
-                index=0,
-                content_block={"type": "thinking"},
-            ))
-        push_event(RuntimeTaskEvent(
-            type="content_block_delta",
-            index=0,
-            delta={"type": "thinking_delta", "thinking": display[-12000:]},
-        ))
-
-    def on_planner(ev: dict[str, Any]) -> None:
-        nonlocal last_flush_len, last_t
-        if ev.get("flush"):
-            reasoning = (ev.get("reasoning") or "").strip()
-            text = (ev.get("text") or "").strip()
-            display = reasoning or text
-            if len(display) > last_flush_len or display:
-                _emit(display)
-                last_flush_len = len(display)
-                last_t = time.monotonic()
-            return
-        reasoning = ev.get("reasoning") or ""
-        text = ev.get("text") or ""
-        display = reasoning.strip() and reasoning or text
-        if not display:
-            return
-        now = time.monotonic()
-        n = len(display)
-        if n - last_flush_len >= batch_chars or (now - last_t) >= flush_interval:
-            _emit(display)
-            last_flush_len = n
-            last_t = now
+    def on_planner(_ev: dict[str, Any]) -> None:
+        return
 
     return on_planner
 
@@ -2119,17 +2080,6 @@ def run_conversation(
     if planning_pre_events is not None:
         runtime_events = planning_pre_events
         saved_events_count = planning_saved_count
-        has_planning_thinking_start = any(
-            ev.type == "content_block_start" and ev.index == PLANNING_THINKING_INDEX
-            for ev in runtime_events
-        )
-        if has_planning_thinking_start:
-            runtime_events.append(
-                RuntimeTaskEvent(
-                    type="content_block_stop",
-                    index=PLANNING_THINKING_INDEX,
-                )
-            )
         runtime_events.append(
             RuntimeTaskEvent(
                 type="content_block_start",
@@ -2223,8 +2173,8 @@ def run_conversation(
             "last_flush_len": 0,
             "last_flush_t": time.monotonic(),
         }
-        batch_chars = 80
-        flush_interval = 0.4
+        batch_chars = 24 if step.skill_name == "general" else 80
+        flush_interval = 0.12 if step.skill_name == "general" else 0.4
 
         def on_text_delta(full_text: str, delta: str) -> None:
             if state["stopped"]:
@@ -2268,8 +2218,8 @@ def run_conversation(
                 state["last_flush_len"] = n
                 state["last_flush_t"] = now
             if is_final and state["started"] and not state["stopped"]:
-                # writing 步骤的最终 stop 需携带完整 payload，统一在主流程拿到 skill_result 后再发送。
-                if step.skill_name != "writing":
+                # writing / general：最终 stop 带 payload，由主流程在拿到 skill_result 后发送。
+                if step.skill_name not in {"writing", "general"}:
                     state["stopped"] = True
                     push(
                         RuntimeTaskEvent(
@@ -2646,10 +2596,11 @@ def run_conversation(
             done_display = display_text_for_step(step, phase="done")
             tool_name = "main_agent" if is_main_agent_step else step.skill_name
 
-            compact_stream = step.skill_name in {"retrieval","general"}
-            text_only_stream = step.skill_name in {"writing"}
+            compact_stream = step.skill_name in {"retrieval"}
+            text_only_stream = step.skill_name in {"writing", "general"}
             # 检索步骤采用紧凑事件：仅保留 tool_use start/stop，不再推送 input_json_delta 与 running。
-            # 写作步骤仅保留 text start/delta/stop 一套事件，避免与 tool_use 形成双轨重复。
+            # writing / general：与公文写作一致，仅 text 流式 + 最终 stop 携带结果，避免 tool_use/running/tool_result 重复正文。
+            # 其它步骤走完整 tool 链 + text_delta。
             if compact_stream:
                 safe_push(
                     RuntimeTaskEvent(
@@ -2720,16 +2671,31 @@ def run_conversation(
             stream_callback = None if compact_stream else step_stream_cb
 
             if is_main_agent_step and pending_direct_answer:
+                raw_direct = pending_direct_answer
+                pending_direct_answer = None
+                text_out = clean_general_text(raw_direct) if (raw_direct or "").strip() else ""
+                if not (text_out or "").strip() and (raw_direct or "").strip():
+                    text_out = (raw_direct or "").strip()
+                # 与 execute_skill(general) 一致：主 Agent 直出此前一次性 synthetic text_delta；改为经 stream_callback 分片，便于前端流式展示。
+                if stream_callback and (text_out or "").strip():
+                    chunk_sz = 18
+                    acc = ""
+                    for i in range(0, len(text_out), chunk_sz):
+                        piece = text_out[i : i + chunk_sz]
+                        acc += piece
+                        stream_callback(acc, piece)
+                    stream_callback(text_out, "")
+                elif stream_callback:
+                    stream_callback("", "")
                 skill_result = SkillExecutionResult(
-                    normalized_result={"text": pending_direct_answer, "source": "planner_direct_answer"},
-                    render_blocks=[{"type": "general", "title": "主 Agent 回复", "html": text_to_html(pending_direct_answer)}],
+                    normalized_result={"text": text_out, "source": "planner_direct_answer"},
+                    render_blocks=[{"type": "general", "title": "主 Agent 回复", "html": text_to_html(text_out)}],
                     artifact_refs=[],
                     editor_annotations=[],
                     retryable=False,
                     source_state="planner_direct_answer",
                     error_detail=None,
                 )
-                pending_direct_answer = None
             elif is_main_agent_step:
                 skill_result = execute_skill(
                     step.skill_name,
@@ -2755,7 +2721,7 @@ def run_conversation(
                     on_text_delta=stream_callback,
                 )
 
-            # 如果本步骤未走流式通道（例如 retrieval/writing 的 legacy JSON 成功），
+            # 如果本步骤未走流式通道（例如 retrieval compact、writing/general 仅 stop 带 payload 等），
             # 但仍有可展示的正文/摘要，则补发一次合成的 text 块，便于前端编辑器联动。
             retrieval_summary_on_stop = False
             if not compact_stream and not stream_has_started():
@@ -2806,7 +2772,7 @@ def run_conversation(
                                 delta={"type": "text_delta", "text": synthetic_text},
                             )
                         )
-                        if step.skill_name != "writing":
+                        if step.skill_name not in {"writing", "general"}:
                             safe_push(
                                 RuntimeTaskEvent(
                                     type="content_block_stop",

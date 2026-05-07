@@ -88,6 +88,7 @@ class MainAgent:
             }
 
         messages = self._build_messages(user_message, attachments, runtime_context, memory_context)
+        tool_schema = self.agent_tool.get_tool_schema()
         log_stage(
             "planner.request",
             {
@@ -104,8 +105,8 @@ class MainAgent:
             max_string_chars=settings.debug_log_max_string_chars,
         )
         try:
-            # Planner 固定非流式：部分私有化网关对 stream=true + tools 仅返回空 delta，导致误判为空响应。
-            # Skill 执行仍由各 skill LLM（call_chat_model 等）按需 stream:true，不受影响。
+            use_planner_stream = settings.planner_stream
+
             def _call_planner(*, strip_hint: bool = False, tool_choice: str = "auto") -> dict[str, Any]:
                 """实际发起 planner 请求。
 
@@ -113,6 +114,7 @@ class MainAgent:
                   规避部分网关对未知字段或 /no_think 附加文本不兼容而返回 400/422。
                 - ``tool_choice`` 通常为 ``auto``；对写作类意图可尝试 ``required`` 强制至少一次 tool call
                   （网关不支持时由外层重试回退为 ``auto``）。
+                - 默认 ``planner_stream`` 为流式；网关不兼容时可在 model.json 将 ``planner_stream`` 设为 false。
                 """
                 purpose = "planner.retry_no_think_hint" if strip_hint else "planner"
                 if not strip_hint:
@@ -125,7 +127,7 @@ class MainAgent:
                             "tools": [tool_schema],
                             "tool_choice": tool_choice,
                         },
-                        stream=False,
+                        stream=use_planner_stream,
                         on_stream_event=None,
                     )
                 _prev = settings.llm_disable_thinking
@@ -142,7 +144,7 @@ class MainAgent:
                             "tools": [tool_schema],
                             "tool_choice": tool_choice,
                         },
-                        stream=False,
+                        stream=use_planner_stream,
                         on_stream_event=None,
                     )
                 finally:
@@ -188,19 +190,6 @@ class MainAgent:
                     raise last_exc
                 raise LLMCallError("planner: 无可用响应")
             message = response.get("message") or {}
-            if on_planner_stream:
-                raw_content_flush = self._message_text(message)
-                raw_reasoning_flush = self._message_reasoning(message).strip()
-                # Qwen3 等将推理写入 content 内的 <think>...</think>；
-                # flush 前把推理与正文拆开，避免 thinking_delta 混入 <think> 标签或重复打印正文。
-                embedded_reasoning_flush, body_flush = split_think_content(raw_content_flush)
-                on_planner_stream(
-                    {
-                        "reasoning": raw_reasoning_flush or embedded_reasoning_flush,
-                        "text": body_flush,
-                        "flush": True,
-                    }
-                )
             plan, planner_meta = self._plan_from_response(user_message, response, attachments)
             log_stage(
                 "planner.response",
