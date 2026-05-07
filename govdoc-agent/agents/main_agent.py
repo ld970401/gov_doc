@@ -18,6 +18,70 @@ _OPEN_THINK_RE = re.compile(r"<\s*think\s*>\s*", re.IGNORECASE)
 _CLOSE_THINK_RE = re.compile(r"<\s*/\s*think\s*>\s*", re.IGNORECASE)
 
 
+def _looks_like_json_plan_blob(text: str) -> bool:
+    """判断是否像整块规划 JSON/Markdown 围栏文本，应避免当作给用户看的「自然语言正文」。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t.startswith("```"):
+        return True
+    if t.startswith("{") and '"intent"' in t and '"steps"' in t:
+        return True
+    return False
+
+
+def _looks_like_internal_planner_voice(text: str) -> bool:
+    """是否像「对用户输入做第三人称研判」的 planner 内部说明，不宜作为给用户看的正文。"""
+    t = (text or "").strip()
+    if len(t) < 6:
+        return False
+    needles = (
+        "需进一步确认用户意图",
+        "未提供具体任务",
+        "用户输入关键词",
+        "用户仅输入",
+        "用户未提供",
+        "未明确具体需求",
+        "信息不足，无法",
+        "无法判断用户意图",
+    )
+    if any(n in t for n in needles):
+        return True
+    # 「用户…关键词」且带「确认/意图/描述」等
+    if "用户输入" in t and any(k in t for k in ("意图", "确认", "描述", "任务")):
+        return True
+    return False
+
+
+def _fallback_user_visible_reply(user_message: str) -> str:
+    """模型输出研判式废话时的兜底：面向用户、可执行引导。"""
+    um = (user_message or "").strip()
+    if not um:
+        return (
+            "您好。为更准确地协助，请说明：需要**检索**政策与范文，还是**起草**某类公文（如通知、报告）？"
+            "也可直接说文种、用途和受众。"
+        )
+    snippet = um[:48] + ("…" if len(um) > 48 else "")
+    return (
+        f"您提到了「{snippet}」。在公文场景下，常见做法是先**检索**相关政策表述与同类范文，再按需**起草**文稿。"
+        f"请补一句：更想做哪一类（例如防震减灾工作部署通知、情况报告、应急预案说明等），或说明发文对象与用途，我按您的目标继续。"
+    )
+
+
+def _plan_json_one_shot_reply(plan_data: dict[str, Any]) -> str | None:
+    """从规划 JSON 中取「单轮主 Agent 直接回复」正文（与 steps: [] 的一轮模型输出配套）。"""
+    for key in ("assistantReply", "reply", "answer", "userFacingAnswer"):
+        val = plan_data.get(key)
+        if isinstance(val, str) and val.strip():
+            t = val.strip()
+            if not _looks_like_internal_planner_voice(t) and not _looks_like_json_plan_blob(t):
+                return t
+    summ = (plan_data.get("summary") or "").strip()
+    if summ and not _looks_like_json_plan_blob(summ) and not _looks_like_internal_planner_voice(summ):
+        return summ
+    return None
+
+
 def split_think_content(content: str) -> tuple[str, str]:
     """分离 ``<think>...</think>`` 推理段与真正的助手回复。
 
@@ -384,7 +448,13 @@ class MainAgent:
                 deps.append(sid)
         return deps
 
-    def _build_plan_from_json(self, user_message: str, plan_data: dict[str, Any]) -> tuple[ExecutionPlan, dict[str, Any] | None]:
+    def _build_plan_from_json(
+        self,
+        user_message: str,
+        plan_data: dict[str, Any],
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> tuple[ExecutionPlan, dict[str, Any] | None, dict[str, Any]]:
+        attachments = attachments or []
         raw_steps = plan_data.get("steps") or []
         if not isinstance(raw_steps, list):
             raise ValueError("planner JSON steps 不是数组")
@@ -409,26 +479,43 @@ class MainAgent:
                     "subtask_role": (item.get("subtaskRole") or item.get("subtask_role") or spec.default_subtask_role),
                 }
             )
+        empty_steps_synthetic: dict[str, Any] | None = None
         if not step_infos:
-            raise ValueError("planner JSON 未包含有效 steps")
-        steps: list[ExecutionStep] = []
-        for info in step_infos:
-            depends_on = self._normalize_depends_on(info["depends_raw"], step_infos, info["index"])
-            steps.append(
-                ExecutionStep(
-                    index=info["index"],
-                    skill_name=info["skill_name"],
-                    title=info["title"],
-                    objective=info["objective"],
-                    scope=info["scope"],
-                    depends_on=depends_on,
-                    subtask_role=info["subtask_role"],
-                )
+            intent_early = (plan_data.get("intent") or "").strip() or (
+                "document_workflow" if self._looks_like_writing_request(user_message) else "general_chat"
             )
+            # 模型常输出 general_chat/explicit_skill 且 steps: []；若抛错会落到 planner_direct_answer 并把整段 JSON 流给用户。
+            if intent_early not in {"general_chat", "explicit_skill"}:
+                raise ValueError("planner JSON 未包含有效 steps")
+            fb = build_fallback_execution_plan(user_message, None, attachments)
+            steps = list(fb.steps)
+            empty_steps_synthetic = {
+                "type": "synthetic_steps_from_empty_json_steps",
+                "reason": "planner_json_general_or_explicit_skill_with_empty_steps",
+                "intent": intent_early,
+                "delivery": "directAnswer_single_llm_turn",
+            }
+        else:
+            steps = []
+            for info in step_infos:
+                depends_on = self._normalize_depends_on(info["depends_raw"], step_infos, info["index"])
+                steps.append(
+                    ExecutionStep(
+                        index=info["index"],
+                        skill_name=info["skill_name"],
+                        title=info["title"],
+                        objective=info["objective"],
+                        scope=info["scope"],
+                        depends_on=depends_on,
+                        subtask_role=info["subtask_role"],
+                    )
+                )
         embedded_reasoning = ""
         if isinstance(plan_data.get("reasoning"), str):
             embedded_reasoning = (plan_data.get("reasoning") or "").strip()
         steps, normalization = self._normalize_document_steps(user_message, steps, embedded_reasoning)
+        if empty_steps_synthetic is not None:
+            normalization = {**(normalization or {}), **empty_steps_synthetic}
         summary = (plan_data.get("summary") or "").strip()
         if not summary:
             summary = f"主 Agent 已规划 {len(steps)} 个 sub-agent 步骤。"
@@ -437,6 +524,12 @@ class MainAgent:
         clarification_question = plan_data.get("clarificationQuestion")
         if clarification_question is not None and not isinstance(clarification_question, str):
             clarification_question = str(clarification_question)
+        planner_extras: dict[str, Any] = {}
+        if empty_steps_synthetic is not None:
+            text = _plan_json_one_shot_reply(plan_data) or _fallback_user_visible_reply(user_message)
+            if _looks_like_json_plan_blob(text) or _looks_like_internal_planner_voice(text):
+                text = _fallback_user_visible_reply(user_message)
+            planner_extras["directAnswer"] = text
         return (
             ExecutionPlan(
                 intent=intent,
@@ -446,6 +539,7 @@ class MainAgent:
                 clarification_question=clarification_question,
             ),
             normalization,
+            planner_extras,
         )
 
     def _plan_from_response(
@@ -465,20 +559,20 @@ class MainAgent:
         reasoning_content = raw_reasoning or embedded_reasoning
         try:
             plan_data = extract_json_object(assistant_text)
-            plan, normalization = self._build_plan_from_json(user_message, plan_data)
-            return (
-                plan,
-                {
-                    "planner": "main_agent_json_plan",
-                    "fallback": False,
-                    "dispatchMode": "json_plan",
-                    "modelName": response["model_name"],
-                    "assistantText": assistant_text,
-                    "reasoningContent": reasoning_content,
-                    "normalization": normalization,
-                    "raw": response["raw"],
-                },
-            )
+            plan, normalization, planner_extras = self._build_plan_from_json(user_message, plan_data, attachments)
+            meta: dict[str, Any] = {
+                "planner": "main_agent_json_plan",
+                "fallback": False,
+                "dispatchMode": "json_plan",
+                "modelName": response["model_name"],
+                "assistantText": assistant_text,
+                "reasoningContent": reasoning_content,
+                "normalization": normalization,
+                "raw": response["raw"],
+            }
+            if planner_extras.get("directAnswer"):
+                meta["directAnswer"] = planner_extras["directAnswer"]
+            return plan, meta
         except (LLMCallError, ValueError, json.JSONDecodeError):
             pass
 
@@ -579,8 +673,22 @@ class MainAgent:
                 },
             )
 
+        direct_answer_text = assistant_text
+        if (direct_answer_text or "").strip():
+            try:
+                pd = extract_json_object(direct_answer_text)
+                steps_pd = pd.get("steps") if isinstance(pd.get("steps"), list) else []
+                if len(steps_pd) == 0:
+                    cand = _plan_json_one_shot_reply(pd)
+                    if cand:
+                        direct_answer_text = cand
+            except (LLMCallError, ValueError, json.JSONDecodeError):
+                pass
+        if _looks_like_internal_planner_voice((direct_answer_text or "").strip()):
+            direct_answer_text = _fallback_user_visible_reply(user_message)
+
         direct_plan = build_fallback_execution_plan(user_message, None, attachments)
-        effective_summary = assistant_text or "模型未返回直接可用的答复，已切换到默认处理流程。"
+        effective_summary = direct_answer_text or assistant_text or "模型未返回直接可用的答复，已切换到默认处理流程。"
         direct_plan.summary = effective_summary
         return (
             direct_plan,
@@ -593,7 +701,7 @@ class MainAgent:
                 "reasoningContent": reasoning_content,
                 # 仅当模型剥离 <think> 后确实给出了正文才作为 directAnswer 下发，
                 # 否则下游不会把"空字符串"或"纯思考内容"直接展示给用户。
-                "directAnswer": assistant_text or None,
+                "directAnswer": direct_answer_text or None,
                 "raw": response["raw"],
             },
         )

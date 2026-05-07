@@ -14,6 +14,7 @@ Runtime 端到端冒烟测试（无网络、无 DB）。
 
 from __future__ import annotations
 
+import json
 import unittest
 from unittest.mock import patch
 
@@ -306,6 +307,69 @@ class TestWritingDetectionAndNormalization(unittest.TestCase):
         self.assertEqual(meta.get("planner"), "main_agent_json_plan")
         self.assertEqual([s.skill_name for s in plan.steps], ["retrieval", "writing"])
         self.assertEqual(plan.steps[1].depends_on, ["step_01_retrieval"])
+
+    def test_plan_from_json_general_chat_empty_steps_direct_answer_one_llm(self) -> None:
+        """general_chat + steps: [] 时在 planner_meta 中带 directAnswer，由 runtime 单轮流式直出，不调 general 第二次。"""
+        reply = "通知一般包括标题、主送机关、正文、发文机关与日期等要素。"
+        payload = {
+            "intent": "general_chat",
+            "summary": "简述通知结构",
+            "requiresUserInput": False,
+            "clarificationQuestion": None,
+            "steps": [],
+            "assistantReply": reply,
+        }
+        response = {
+            "model_name": "stub",
+            "message": {"content": json.dumps(payload, ensure_ascii=False)},
+            "raw": {},
+        }
+        plan, meta = self.agent._plan_from_response("通知格式有哪些", response, [])
+        self.assertEqual(meta.get("planner"), "main_agent_json_plan")
+        self.assertEqual(meta.get("directAnswer"), reply)
+        self.assertEqual(plan.intent, "general_chat")
+        self.assertEqual([s.skill_name for s in plan.steps], ["general"])
+        norm = meta.get("normalization") or {}
+        self.assertEqual(norm.get("type"), "synthetic_steps_from_empty_json_steps")
+        self.assertEqual(norm.get("delivery"), "directAnswer_single_llm_turn")
+
+    def test_plan_from_json_general_chat_empty_steps_falls_back_summary(self) -> None:
+        """无 assistantReply 时用非 JSON 形态的 summary 作为 directAnswer。"""
+        response = {
+            "model_name": "stub",
+            "message": {
+                "content": (
+                    '{"intent":"general_chat","summary":"用户询问通知格式，用自然语言说明。",'
+                    '"requiresUserInput":false,"clarificationQuestion":null,"steps":[]}'
+                )
+            },
+            "raw": {},
+        }
+        plan, meta = self.agent._plan_from_response("通知怎么写", response, [])
+        self.assertEqual(meta.get("planner"), "main_agent_json_plan")
+        self.assertEqual(meta.get("directAnswer"), "用户询问通知格式，用自然语言说明。")
+        self.assertEqual([s.skill_name for s in plan.steps], ["general"])
+
+    def test_plan_from_json_empty_steps_meta_summary_gets_user_fallback(self) -> None:
+        """研判式 summary 不得作为 directAnswer，应替换为面向用户的引导。"""
+        payload = {
+            "intent": "general_chat",
+            "summary": "用户输入关键词「地震」，未提供具体任务描述，需进一步确认用户意图。",
+            "requiresUserInput": False,
+            "clarificationQuestion": None,
+            "steps": [],
+        }
+        response = {
+            "model_name": "stub",
+            "message": {"content": json.dumps(payload, ensure_ascii=False)},
+            "raw": {},
+        }
+        plan, meta = self.agent._plan_from_response("地震", response, [])
+        self.assertEqual(meta.get("planner"), "main_agent_json_plan")
+        da = meta.get("directAnswer") or ""
+        self.assertNotIn("需进一步确认用户意图", da)
+        self.assertIn("地震", da)
+        self.assertEqual([s.skill_name for s in plan.steps], ["general"])
 
 
 class TestRetrievalExecutionBehavior(unittest.TestCase):

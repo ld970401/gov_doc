@@ -2077,74 +2077,92 @@ def run_conversation(
         "displayText": f"已规划 {len(plan.steps)} 个执行步骤",
     }
 
+    # 主 Agent 单轮直答（directAnswer）：不向 SSE 下发「执行规划」块，避免与「直接回复」体验重复。
+    suppress_planning_sse = bool((planner_meta.get("directAnswer") or "").strip())
+    message_start_event = RuntimeTaskEvent(
+        type="message_start",
+        payload={
+            "taskPacket": packet.model_dump(),
+            "registry": root_task.snapshot(),
+            "taskId": task_id,
+            "requestedSkill": primary_skill,
+        },
+    )
+
     if planning_pre_events is not None:
-        runtime_events = planning_pre_events
+        runtime_events = list(planning_pre_events)
         saved_events_count = planning_saved_count
-        runtime_events.append(
-            RuntimeTaskEvent(
-                type="content_block_start",
-                index=planning_tool_use_index,
-                content_block={
-                    "type": "tool_use",
-                    "name": "a2a_planning",
-                    "skillName": "a2a_planning",
-                    "stepIndex": 0,
-                    "stepTitle": "执行规划",
-                    "displayText": "进行中：执行规划",
-                },
+        if not suppress_planning_sse:
+            runtime_events.append(
+                RuntimeTaskEvent(
+                    type="content_block_start",
+                    index=planning_tool_use_index,
+                    content_block={
+                        "type": "tool_use",
+                        "name": "a2a_planning",
+                        "skillName": "a2a_planning",
+                        "stepIndex": 0,
+                        "stepTitle": "执行规划",
+                        "displayText": "进行中：执行规划",
+                    },
+                )
             )
-        )
-        runtime_events.append(
-            RuntimeTaskEvent(
-                type="content_block_stop",
-                index=planning_tool_use_index,
-                payload=planning_tool_result_payload,
+            runtime_events.append(
+                RuntimeTaskEvent(
+                    type="content_block_stop",
+                    index=planning_tool_use_index,
+                    payload=planning_tool_result_payload,
+                )
             )
-        )
+        elif not runtime_events:
+            # prepare_run 已持久化首条 message_start，勿再写入，否则 SSE 出现两个 message_start。
+            if not (suppress_planning_sse and prepared_run_id):
+                runtime_events = [message_start_event]
+        elif not any(ev.type == "message_start" for ev in runtime_events):
+            if not (suppress_planning_sse and prepared_run_id):
+                runtime_events.insert(0, message_start_event)
     else:
-        runtime_events = [
-            RuntimeTaskEvent(
-                type="message_start",
-                payload={
-                    "taskPacket": packet.model_dump(),
-                    "registry": root_task.snapshot(),
-                    "taskId": task_id,
-                    "requestedSkill": primary_skill,
-                },
-            ),
-            RuntimeTaskEvent(
-                type="content_block_start",
-                index=PLANNING_THINKING_INDEX,
-                content_block={"type": "thinking"},
-            ),
-            RuntimeTaskEvent(
-                type="content_block_delta",
-                index=PLANNING_THINKING_INDEX,
-                delta={"type": "thinking_delta", "thinking": planner_meta.get("reasoningContent") or "正在生成执行计划..."},
-            ),
-            RuntimeTaskEvent(
-                type="content_block_stop",
-                index=PLANNING_THINKING_INDEX,
-            ),
-            RuntimeTaskEvent(
-                type="content_block_start",
-                index=planning_tool_use_index,
-                content_block={
-                    "type": "tool_use",
-                    "name": "a2a_planning",
-                    "skillName": "a2a_planning",
-                    "stepIndex": 0,
-                    "stepTitle": "执行规划",
-                    "displayText": "进行中：执行规划",
-                },
-            ),
-            RuntimeTaskEvent(
-                type="content_block_stop",
-                index=planning_tool_use_index,
-                payload=planning_tool_result_payload,
-            ),
-        ]
-        saved_events_count = 0
+        if suppress_planning_sse:
+            # 与上同理：execute_prepared_run 前必先 prepare_run，库中已有 message_start。
+            runtime_events = [] if prepared_run_id else [message_start_event]
+            saved_events_count = 0
+        else:
+            after_start = [
+                RuntimeTaskEvent(
+                    type="content_block_start",
+                    index=PLANNING_THINKING_INDEX,
+                    content_block={"type": "thinking"},
+                ),
+                RuntimeTaskEvent(
+                    type="content_block_delta",
+                    index=PLANNING_THINKING_INDEX,
+                    delta={"type": "thinking_delta", "thinking": planner_meta.get("reasoningContent") or "正在生成执行计划..."},
+                ),
+                RuntimeTaskEvent(
+                    type="content_block_stop",
+                    index=PLANNING_THINKING_INDEX,
+                ),
+                RuntimeTaskEvent(
+                    type="content_block_start",
+                    index=planning_tool_use_index,
+                    content_block={
+                        "type": "tool_use",
+                        "name": "a2a_planning",
+                        "skillName": "a2a_planning",
+                        "stepIndex": 0,
+                        "stepTitle": "执行规划",
+                        "displayText": "进行中：执行规划",
+                    },
+                ),
+                RuntimeTaskEvent(
+                    type="content_block_stop",
+                    index=planning_tool_use_index,
+                    payload=planning_tool_result_payload,
+                ),
+            ]
+            # prepare_run 已写入 message_start；仅有 prepared_run_id 时不要重复。
+            runtime_events = ([message_start_event, *after_start] if not prepared_run_id else after_start)
+            saved_events_count = 0
     db.commit()
     _, saved_events_count = _save_new_events(db, run, current_user, runtime_events, saved_events_count)
 
@@ -2156,6 +2174,9 @@ def run_conversation(
     def make_step_stream_callback(
         step: ExecutionStep,
         push: Callable[[RuntimeTaskEvent], None],
+        *,
+        batch_chars_override: int | None = None,
+        flush_interval_override: float | None = None,
     ) -> tuple[Callable[[str, str], None], Callable[[], bool]]:
         """为单个子步骤生成流式 text_delta 回调。
 
@@ -2173,8 +2194,14 @@ def run_conversation(
             "last_flush_len": 0,
             "last_flush_t": time.monotonic(),
         }
-        batch_chars = 24 if step.skill_name == "general" else 80
-        flush_interval = 0.12 if step.skill_name == "general" else 0.4
+        if batch_chars_override is not None:
+            batch_chars = max(1, batch_chars_override)
+        else:
+            batch_chars = 24 if step.skill_name == "general" else 80
+        if flush_interval_override is not None:
+            flush_interval = max(0.0, flush_interval_override)
+        else:
+            flush_interval = 0.12 if step.skill_name == "general" else 0.4
 
         def on_text_delta(full_text: str, delta: str) -> None:
             if state["stopped"]:
@@ -2667,7 +2694,16 @@ def run_conversation(
                     )
                 )
 
-            step_stream_cb, stream_has_started = make_step_stream_callback(step, safe_push)
+            # planner_direct_answer：上游已一次性给出全文，需更细的 SSE 分片；默认 general 的 batch 24/0.12s 会把多段合成大块。
+            if is_main_agent_step and pending_direct_answer:
+                step_stream_cb, stream_has_started = make_step_stream_callback(
+                    step,
+                    safe_push,
+                    batch_chars_override=8,
+                    flush_interval_override=0.02,
+                )
+            else:
+                step_stream_cb, stream_has_started = make_step_stream_callback(step, safe_push)
             stream_callback = None if compact_stream else step_stream_cb
 
             if is_main_agent_step and pending_direct_answer:
@@ -2678,7 +2714,7 @@ def run_conversation(
                     text_out = (raw_direct or "").strip()
                 # 与 execute_skill(general) 一致：主 Agent 直出此前一次性 synthetic text_delta；改为经 stream_callback 分片，便于前端流式展示。
                 if stream_callback and (text_out or "").strip():
-                    chunk_sz = 18
+                    chunk_sz = 8
                     acc = ""
                     for i in range(0, len(text_out), chunk_sz):
                         piece = text_out[i : i + chunk_sz]

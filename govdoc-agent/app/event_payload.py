@@ -141,6 +141,7 @@ def _slim_planner_meta(meta: dict[str, Any] | None) -> dict[str, Any] | None:
         "requestedSkill",
         "normalization",
         "assistantText",
+        "directAnswer",
     }
     slim = {k: v for k, v in meta.items() if k in keep}
     reasoning = meta.get("reasoningContent")
